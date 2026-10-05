@@ -347,8 +347,8 @@ curl -Ls "https://git.zerrolabs.org/Ground-Zerro/release/pages/keenetic/hr-unins
 ```
 
 > Будут удалены:  
-> - пакеты: `hrneo`, `hrweb`, `ipset`, `iptables`, `jq`, `hydraroute`, `adguardhome-go`, `node`, `node-npm`, `xray`, `xray-core`  
-> - папки: `/opt/etc/HydraRoute`, `/opt/etc/AdGuardHome`, `/opt/etc/xray/`
+> - пакеты: `hrneo`, `hrweb`, `smartdns-webui`, `ipset`, `iptables`, `jq`, `hydraroute`, `adguardhome-go`, `node`, `node-npm`, `xray`, `xray-core`  
+> - папки: `/opt/etc/HydraRoute`, `/opt/etc/AdGuardHome`, `/opt/etc/xray/`, `/opt/etc/Phobos`, `/opt/etc/smartdns-webui`, `/opt/var/lib/hrdns`, `/opt/var/lib/smartdns-webui`
 
 Стандартное:
 ```bash
