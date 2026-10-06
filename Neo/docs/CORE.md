@@ -1,6 +1,6 @@
 # HRNeo — техническая документация кодовой базы
 
-Исходный код HRNeo (HydraRoute Neo) v3.20.0-1: архитектура, модули, потоки данных, оптимизации.
+Исходный код HRNeo (HydraRoute Neo) v3.21.0-1: архитектура, модули, потоки данных, оптимизации.
 
 ---
 
@@ -15,19 +15,20 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
 
 ### Принцип работы (пошагово)
 
-1. Читается конфигурация из `/opt/etc/HydraRoute/hrneo.conf` (29 параметров; CLI-флаги поверх конфига; недостающие — встроенные дефолты).
+1. Читается конфигурация из `/opt/etc/HydraRoute/hrneo.conf` (30 параметров; CLI-флаги поверх конфига; недостающие — встроенные дефолты).
 
-2. Если `DirectRouteEnabled=true` — сканируется `/sys/class/net/`, строится карта системных интерфейсов (`drm_scan_interfaces`): для каждого имени читается `/sys/class/net/<name>/operstate` (`up`/`down`/`unknown`). Карта нужна, чтобы при разборе watchlist различать «политика Keenetic» и «сетевой интерфейс для DirectRoute».
+2. Если `DirectRouteEnabled=true` — сканируется `/sys/class/net/`, строится карта системных интерфейсов (`drm_scan_interfaces`): для каждого имени читается `/sys/class/net/<name>/operstate` (`up`/`down`/`unknown`). Карта нужна, чтобы при разборе watchlist различать «политика Keenetic» и «сетевой интерфейс для DirectRoute». Скан однократный: `SIGUSR1` его не повторяет, интерфейс, появившийся позже, подхватывается только перезапуском.
 
 3. Парсится watchlist (`domain.conf`). Каждая строка имеет формат `домен1,домен2,geosite:TAG/Цель`. Цель классифицируется через `drm_classify_target` по карте интерфейсов из шага 2:
    - имя совпало с интерфейсом → цель является интерфейсом (DirectRoute, маршрутизация будет через `ip rule + ip route`)
-   - не совпало → цель является политикой Keenetic (маршрутизация будет через политику роутера с её mark)
+   - не совпало, но совпало с шаблоном `ForceInterface` → интерфейса ещё нет (`TARGET_ABSENT_INTERFACE`): строка пропускается вместе с доменами, цель не попадает ни в один список; так же отбрасываются её заголовки CIDR и `geosite:`-правила (шаги 4–5)
+   - иначе → цель является политикой Keenetic (маршрутизация будет через политику роутера с её mark)
 
    Результат: разделённые массивы `policy_names[]` и `iface_names[]`. Лог: `[INFO] domain.conf: %d policies, %d interfaces`.
 
-4. Опционально (`CIDR=true`): из `CIDRfile` (`ip.list`) извлекаются уникальные заголовки `/Name` через `parse_cidr_policy_headers`. Каждое имя классифицируется через `drm_classify_target`: интерфейсы дописываются в `iface_names[]`, остальные — в список политик. Лог на каждое новое имя: `[INFO] CIDR: added policy 'X'`.
+4. Опционально (`CIDR=true`): из `CIDRfile` (`ip.list`) извлекаются уникальные заголовки `/Name` через `parse_cidr_policy_headers`. Каждое имя классифицируется через `drm_classify_target` (хелпер `add_target` в `main.c`): интерфейсы дописываются в `iface_names[]`, политики — в список политик, `TARGET_ABSENT_INTERFACE` никуда. Ipset для отсутствующей цели не создаётся, поэтому её блок `add_cidr_to_ipsets` на шаге 9 пропускает сам (`CIDR block start: X (skipped - no ipsets exist)`). Лог на каждое новое имя: `[INFO] CIDR: added policy 'X'`.
 
-5. `parse_geosite_rules` собирает `geosite:TAG/Цель` из watchlist'а. Есть `GeoSiteFile` — цели раскладываются так же: интерфейсы в `iface_names[]`, политики в `policy_names[]`; лог `[INFO] GeoSite: added policy 'X'`. Нет `GeoSiteFile` — на каждую директиву `[WARN] GeoSite directive 'geosite:TAG' found but GeoSiteFile not configured`, правила отбрасываются (как `geoip:` без `GeoIPFile`).
+5. `parse_geosite_rules` собирает `geosite:TAG/Цель` из watchlist'а. Есть `GeoSiteFile` — цели раскладываются так же (`add_target`): интерфейсы в `iface_names[]`, политики в `policy_names[]`; правила с `TARGET_ABSENT_INTERFACE` удаляются из `gs_rules[]` уплотнением массива, и шаг 10 их домены не загружает; лог `[INFO] GeoSite: added policy 'X'`. Нет `GeoSiteFile` — на каждую директиву `[WARN] GeoSite directive 'geosite:TAG' found but GeoSiteFile not configured`, правила отбрасываются (как `geoip:` без `GeoIPFile`).
 
    После шагов 4-5 для каждого имени из `iface_names[]` выделяются `fwmark`/`table_id` и регистрируется маршрут (`drm_register_route`). Регистрация идёт именно здесь, а не сразу после watchlist'а: цель-интерфейс может быть объявлена только в `ip.list` или в `geosite:`-правиле, и без этого она не получала бы ни ipset (в т.ч. `FLUSH` на старте), ни `CONNMARK`-правило, ни `ip rule`.
 
@@ -179,11 +180,11 @@ DNS-ответ (ndnproxy и др.) → клиент (любой интерфей
 
 > В `hrneo.h` **НЕТ** `arena_t` / `ARENA_SIZE` — все временные буферы статические/на стеке.
 
-### `config_t` (29 полей)
+### `config_t` (30 полей)
 
 См. `src/params.c` и `docs/HRNEO.CONF.md`. Поля:
 
-`auto_start`, `watchlist_path`, `clear_ipset`, `cidr_enabled`, `cidr_file_path`, `ipset_enable_timeout`, `ipset_timeout`, `log_level`, `log_file_path`, `direct_route_enabled` (default 1), `interface_fwmark_start` (12289), `interface_table_start` (301), `global_routing`, `conntrack_flush` (1), `ipset_maxelem` (262144), `geo_ip_files[16][512]`+counter, `geo_site_files[16][512]`+counter, `policy_order[64][64]`+counter, `l7_capture_enabled` (0), `l7_nflog_group` (210), `l7_enable_tls` (1), `l7_enable_http` (1), `l7_connbytes_max` (8), `l7_wan_interface[32]`, `l7_tcp_reasm_enabled` (1), `l7_tcp_reasm_max_entries` (256), `l7_tcp_reasm_ttl_sec` (5), `l7_enable_quic` (1), `rci_token[512]`.
+`auto_start`, `watchlist_path`, `clear_ipset`, `cidr_enabled`, `cidr_file_path`, `ipset_enable_timeout`, `ipset_timeout`, `log_level`, `log_file_path`, `direct_route_enabled` (default 1), `interface_fwmark_start` (12289), `interface_table_start` (301), `force_interfaces[64][64]`+counter, `global_routing`, `conntrack_flush` (1), `ipset_maxelem` (262144), `geo_ip_files[16][512]`+counter, `geo_site_files[16][512]`+counter, `policy_order[64][64]`+counter, `l7_capture_enabled` (0), `l7_nflog_group` (210), `l7_enable_tls` (1), `l7_enable_http` (1), `l7_connbytes_max` (8), `l7_wan_interface[32]`, `l7_tcp_reasm_enabled` (1), `l7_tcp_reasm_max_entries` (256), `l7_tcp_reasm_ttl_sec` (5), `l7_enable_quic` (1), `rci_token[512]`.
 
 ### Глобальные переменные `main.c`
 
@@ -229,8 +230,8 @@ int                     g_policies_pending;         // rci_create_policies не 
 6b. `create_pid_file()`
 7. `ht_create()` — создание хеш-таблицы доменов
 8. Если DirectRoute: `drm_init()`, `drm_scan_interfaces()`, `parse_watchlist_classified()`. Иначе: `parse_watchlist()`, `get_unique_names()`
-9. `CIDR=true`: `parse_cidr_policy_headers()` — имена из заголовков `/Name` CIDR-файла раскладываются по `drm_classify_target` в `iface_names[]`/`policy_names[]`; `LOG_INFO "CIDR: added policy 'X'"` для каждой новой политики
-10. `parse_geosite_rules()` — всегда. GeoSite-файлы заданы: цели `geosite:`-правил раскладываются так же, `LOG_INFO "GeoSite: added policy 'X'"` для каждой новой политики. Не заданы: `LOG_WARN "GeoSite directive 'geosite:%s' found but GeoSiteFile not configured"` на каждую директиву, `gs_count = 0`
+9. `CIDR=true`: `parse_cidr_policy_headers()` — имена из заголовков `/Name` CIDR-файла раскладываются через `add_target()` (`drm_classify_target`) в `iface_names[]`/`policy_names[]`, отсутствующие интерфейсы `ForceInterface` отбрасываются; `LOG_INFO "CIDR: added policy 'X'"` для каждой новой политики
+10. `parse_geosite_rules()` — всегда. GeoSite-файлы заданы: цели `geosite:`-правил раскладываются так же через `add_target()`, правила отсутствующих интерфейсов `ForceInterface` вычёркиваются из `gs_rules[]` (`gs_count` уменьшается), `LOG_INFO "GeoSite: added policy 'X'"` для каждой новой политики. Не заданы: `LOG_WARN "GeoSite directive 'geosite:%s' found but GeoSiteFile not configured"` на каждую директиву, `gs_count = 0`
 10a. Если DirectRoute: для каждого имени из `iface_names[]` — `drm_allocate_fwmark()`, `drm_allocate_table_id()`, `drm_register_route()`
 11. `sort_policies()` для `policy_names` с учётом `PolicyOrder`
 12. `g_all_sorted[]`: `all_names = policy_names + iface_names`, `sort_policies()` на объединении; `unified_target_t = {pair (ipv4/ipv6 имена), is_interface, fwmark}`
@@ -384,7 +385,7 @@ BFS-обход CNAME-цепочки (до `MAX_CNAME_CHAIN=16` шагов). По
 
 ### `parse_watchlist_classified` (`routing.c`)
 
-`on_target` классифицирует через `drm_classify_target` и сортирует в `policy_names[]`/`iface_names[]`; `on_domain` делает `ht_insert`. Итог: `LOG_INFO "domain.conf: %d policies, %d interfaces"`.
+`on_target` классифицирует через `drm_classify_target` и сортирует в `policy_names[]`/`iface_names[]`; для `TARGET_ABSENT_INTERFACE` возвращает `0`, и `parse_watchlist_lines` пропускает домены строки — в хеш-таблицу они не попадают. `on_domain` делает `ht_insert`. Итог: `LOG_INFO "domain.conf: %d policies, %d interfaces"` (исключённые цели не считаются).
 
 ### `sort_policies(names, count, order, order_count)`
 
@@ -409,7 +410,7 @@ BFS-обход CNAME-цепочки (до `MAX_CNAME_CHAIN=16` шагов). По
 
 Если домен зарегистрирован сразу в нескольких целях (например, в watchlist прописано `google.com/HydraRoute` и `mail.google.com/RU`, или CNAME-цепочка проходит через домены разных политик), выигрывает цель, стоящая раньше в `g_all_sorted[]` — ровно тот же порядок, что у правил CONNMARK: сначала `PolicyOrder`, затем остальные по алфавиту. После сортировки `main` вызывает `ht_rank_targets(g_all_targets, all_names, all_count)`, который записывает позицию каждой цели в её `ht_target_t.rank` (цели geosite интернируются здесь же, до загрузки их доменов). Длина совпавшего суффикса на выбор не влияет: без `PolicyOrder` для `google.com/CN` + `mail.google.com/RU` домен `mail.google.com` уйдёт в `CN`.
 
-Имена политик Keenetic и имена сетевых интерфейсов смешиваются в одном `PolicyOrder`; hrneo автоматически различает их через `drm_classify_target` по `/sys/class/net`.
+Имена политик Keenetic и имена сетевых интерфейсов смешиваются в одном `PolicyOrder`; hrneo автоматически различает их через `drm_classify_target` по `/sys/class/net` и `ForceInterface`. Исключённая цель `ForceInterface` в `PolicyOrder` даёт `LOG_WARN "PolicyOrder: policy '%s' not found, skipping"`.
 
 `SIGUSR1` не перечитывает `hrneo.conf` и сам `PolicyOrder`; `apply_unified_connmark_rules` пересоздаёт правила в **уже** загруженном порядке `g_all_sorted[]`. Для применения нового `PolicyOrder` требуется `neo restart`.
 
@@ -594,7 +595,7 @@ struct pool_chunk {
 
 | Поле | Назначение |
 |------|------------|
-| `config` | `*config_t` |
+| `config` | `*config_t` (читаются `interface_fwmark_start`, `interface_table_start`, `force_interfaces`) |
 | `interfaces[MAX_INTERFACES=64]` | `interface_info_t (name, state)` |
 | `interface_count` | счётчик интерфейсов |
 | `routes[MAX_INTERFACES]` | `interface_route_t (interface_name, ipset_pair, fwmark, table_id)` |
@@ -603,8 +604,18 @@ struct pool_chunk {
 
 #### Инициализация
 
-1. `parse_watchlist_classified()` → раздельные `policy_names[]`, `iface_names[]`
+1. `parse_watchlist_classified()` → раздельные `policy_names[]`, `iface_names[]`; заголовки CIDR и `geosite:`-правила дописываются туда же через `add_target()`
 2. Для каждого `iface`: `drm_allocate_fwmark()` + `drm_allocate_table_id()` + `drm_register_route()` (создаёт `ipset_pair`: `ipv4 = iface_name`, `ipv6 = iface_name + "v6"`)
+
+#### Классификация цели (`drm_classify_target` → `target_kind_t`)
+
+| Значение | Условие | Что дальше |
+|----------|---------|-----------|
+| `TARGET_INTERFACE` | имя есть в `interfaces[]` (скан `/sys/class/net` на старте) | `iface_names[]`, `fwmark`/таблица, `ip rule`/`ip route`, CONNMARK |
+| `TARGET_ABSENT_INTERFACE` | имени нет в `interfaces[]`, но оно совпало с записью `config->force_interfaces[]` | цель выкидывается целиком: домены строки, блок CIDR, `geosite:`-правила; `LOG_INFO "Interface %s not present (ForceInterface=%s), target skipped"` |
+| `TARGET_POLICY` | иначе | `policy_names[]`, политика Keenetic через RCI |
+
+Присутствие проверяется первым: совпадение с `ForceInterface` на присутствующий интерфейс не влияет. Сопоставление — `iface_pattern_match(pattern, name)`: запись без `X` на конце — `strcmp`; с `X` — префикс до `X` и непустой хвост из одних цифр. Лог пишется в самой функции, а для одной цели её вызывают до трёх раз — `classify_on_target` (domain.conf) и `add_target` в `main.c` (CIDR, geosite), — поэтому цель из нескольких источников даёт несколько строк. В `g_all_sorted[]` исключённые цели не попадают, а `is_interface` выставляется только для `TARGET_INTERFACE`.
 
 #### Активность интерфейса
 
@@ -646,11 +657,15 @@ ip -4|-6 route   replace blackhole default table <tableID>    # если DOWN
 #### Прочие функции
 
 - `drm_scan_interfaces()` — читает `/sys/class/net/`, для каждого только `operstate`
-- `drm_classify_target()` — линейный поиск по имени в `interfaces[]`
+- `drm_classify_target()` — линейный поиск по имени в `interfaces[]`, затем по шаблонам `ForceInterface` → `target_kind_t` (см. «Классификация цели»)
 - `drm_lookup_state()` — состояние интерфейса по имени (`"unknown"` если не найден)
 - `drm_update_used_states()` — обновляет `operstate` только для `routes[]`
 - `drm_get_states(drm, states, count)` — снимок текущих состояний `routes[]` перед обновлением
 - `drm_handle_state_changes(drm, old_states, old_count)` — сравнивает старые и новые; при изменении — `drm_update_route_on_state_change(iface, table_id, new_state)`: `drm_flush_routing_table(table_id)` + `drm_install_route` для обоих семейств
+
+#### Проверка
+
+`tests/check_routing.c` (`make check`): сопоставление `ForceInterface` (точное имя, шаблон `X`, пустой и нецифровой хвост, присутствующий интерфейс важнее шаблона) и `parse_watchlist_classified` на временном `domain.conf` — домены исключённой цели в таблицу не попадают, присутствующий интерфейс и политика раскладываются как обычно.
 
 ---
 
@@ -722,9 +737,9 @@ ip -4|-6 route   replace blackhole default table <tableID>    # если DOWN
 
 ## 10. Файл конфигурации: `src/config.c` + `src/params.c`
 
-Формат: `key=value`, комментарии `#`, пустые строки игнорируются. `GeoIPFile` и `GeoSiteFile` могут повторяться (до `MAX_GEO_FILES=16`); пустое значение (`GeoSiteFile=`, как пишет `config_generate`) файлом не считается — `PT_REPEAT_PATH` его пропускает. `PolicyOrder` — через запятую, до `MAX_POLICY_ORDER=64`.
+Формат: `key=value`, комментарии `#`, пустые строки игнорируются. `GeoIPFile` и `GeoSiteFile` могут повторяться (до `MAX_GEO_FILES=16`); пустое значение (`GeoSiteFile=`, как пишет `config_generate`) файлом не считается — `PT_REPEAT_PATH` его пропускает. `PolicyOrder` и `ForceInterface` — через запятую, до `MAX_POLICY_ORDER=64` и `MAX_INTERFACES=64` соответственно.
 
-Описание параметров — таблица `PARAMS[]` в `src/params.c` (`param_def_t`: `config_key`, `cli_flag`, `type`, offset-ы в `config_t`, `set_bit`, `default_int`, `help_arg`, `help_text`, `help_default`). Один ряд на параметр, драйвит `config_read`, `args_parse`, `args_apply`, `print_help`, `config_generate`. Типы: `PT_BOOL`, `PT_INT`, `PT_INT_POS`, `PT_STRING`, `PT_PATH`, `PT_REPEAT_PATH`, `PT_POLICY_ORDER`.
+Описание параметров — таблица `PARAMS[]` в `src/params.c` (`param_def_t`: `config_key`, `cli_flag`, `type`, offset-ы в `config_t`, `set_bit`, `default_int`, `help_arg`, `help_text`, `help_default`). Один ряд на параметр, драйвит `config_read`, `args_parse`, `args_apply`, `print_help`, `config_generate`. Типы: `PT_BOOL`, `PT_INT`, `PT_INT_POS`, `PT_STRING`, `PT_PATH`, `PT_REPEAT_PATH`, `PT_NAME_LIST`. `PT_NAME_LIST` — список имён `char[N][64]` + счётчик из одного значения через запятую (`PolicyOrder`, `ForceInterface`); `buf_size` у него — максимум элементов, а не размер буфера.
 
 Применение значения — единая функция `param_apply(cfg, p, val, strict)` (там же, в `params.c`): её используют и парсер конфига (`strict=0` — невалидное значение → `LOG_WARN`, остаётся дефолт; `PT_BOOL` лояльно трактует всё, кроме `true`, как `false`), и CLI (`strict=1` — невалидное значение → ошибка и выход 1). Числовые значения валидируются полностью (`strtol` + проверка остатка строки).
 
@@ -739,7 +754,7 @@ ip -4|-6 route   replace blackhole default table <tableID>    # если DOWN
 - `target` пустой → `hrneo.conf` рядом с бинарём (`readlink /proc/self/exe → dirname`)
 - `target`-каталог (или со слешем) → `<dir>/hrneo.conf`
 - `target`-файл → записывается ровно по пути
-- Записывает все 29 ключей с дефолтами; пустые multi-value ключи как `Key=`
+- Записывает все 30 ключей с дефолтами; пустые multi-value ключи как `Key=`
 
 > Полное описание ключей и поведения — в `docs/HRNEO.CONF.md`.
 
@@ -795,7 +810,7 @@ geoip:ru
 | `genconfig_target` `char[512]` | путь для `--genconfig` |
 | `keenetic_token` `char[512]` + `keenetic` `int` | токен и флаг режима `--keenetic` |
 | `api_command`, `api_arg` `const char *` | запрос `--match <имя>` (`"MATCH"`, имя) или `--dump` (`"DUMP"`, `NULL`); указатели в `argv` |
-| `set_mask` `uint32_t` | битовая маска: по одному биту на каждый параметр |
+| `set_mask` `uint32_t` | битовая маска: по одному биту на каждый параметр (занято 30 из 32: `BIT(0)`…`BIT(29)`) |
 | `overlay` `config_t` | scratch-конфиг, в который CLI-флаги парсятся тем же `param_apply`, что и файл; дублирующего набора полей нет |
 
 ### `args_parse(argc, argv, out)`
@@ -815,7 +830,7 @@ geoip:ru
 ### `args_apply(args, cfg)`
 
 - Для каждого `PARAMS[i]` с `set_mask & p->set_bit` — копирует поле из `args->overlay` в `cfg` по `cfg_offset` (один и тот же offset для обоих, т.к. overlay — тоже `config_t`)
-- `PT_REPEAT_PATH` / `PT_POLICY_ORDER` заменяют массив полностью (копируются `count` элементов + счётчик)
+- `PT_REPEAT_PATH` / `PT_NAME_LIST` заменяют массив полностью (копируются `count` элементов + счётчик)
 
 > Полный список флагов — `docs/HRNEO.CONF.md`.
 
@@ -1122,7 +1137,7 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 
 ## 16. Система сборки: Makefile
 
-**Версия:** 3.20.0-1
+**Версия:** 3.21.0-1
 **Язык:** C (без CGO, без внешних библиотек)
 
 ### Кросс-компиляция
@@ -1312,7 +1327,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 ## Резюме
 
-**HRNeo v3.20.0-1** — компактный policy routing демон для роутеров Keenetic, написанный на чистом C.
+**HRNeo v3.21.0-1** — компактный policy routing демон для роутеров Keenetic, написанный на чистом C.
 
 Два источника имён хостов:
 
@@ -1323,6 +1338,6 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 
 Event-driven архитектура на `epoll` (`cap.fd4` + `cap.fd6` + `signalfd` + `timerfd` + `g_conntrack.fd` + `nflog_fd` + `reasm_gc_fd`). Загруженный watchlist публикуется через Unix-сокет `/var/run/hrneo.sock` (`MATCH`/`DUMP`), который обслуживает отдельный поток, — для DNS-демонов и других программ (`docs/WATCHLIST_API.md`).
 
-**29 параметров конфига**, все доступны через CLI-флаги (`--flag value`) + `--config <path>`, `--version`/`-v`, `--help`/`-h`, `--genconfig [path]`, `--keenetic <token>`, `--match <имя>`, `--dump`; приоритет: CLI > конфиг > дефолты. Описание параметров — единая таблица `PARAMS[]` в `src/params.c`, драйвит `config_read`, args, `--help`, `--genconfig`.
+**30 параметров конфига**, все доступны через CLI-флаги (`--flag value`) + `--config <path>`, `--version`/`-v`, `--help`/`-h`, `--genconfig [path]`, `--keenetic <token>`, `--match <имя>`, `--dump`; приоритет: CLI > конфиг > дефолты. Описание параметров — единая таблица `PARAMS[]` в `src/params.c`, драйвит `config_read`, args, `--help`, `--genconfig`.
 
 **Оптимизирован:** батчевый netlink (send N / recv N), хеш-таблица доменов 8192 бакетов с chunked pool (256КБ чанки), unified targets, batch `iptables-restore`, коалесцирование сигналов netfilter, conntrack flush через netlink с long-lived сокетом, статическая аллокация в hot path, двунаправленный CNAME BFS, BPF-фильтрация в ядре, `ipset CREATE` с автоматическим запросом kernel-revision, контроль `maxelem` с автомиграцией oversized `geoip:TAG` в disabled-секцию `CIDRfile`.

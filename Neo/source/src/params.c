@@ -70,6 +70,12 @@ const param_def_t PARAMS[] = {
       BIT(11), 0,            301,
       "<int>",                   "Starting routing table ID",                  "301"   },
 
+    { "ForceInterface",       "--ForceInterface",       PT_NAME_LIST,
+      offsetof(config_t, force_interfaces),
+      offsetof(config_t, force_interface_count),
+      BIT(29), MAX_INTERFACES, 0,
+      "<if1,ifX,...>",           "Targets always treated as interfaces (X = any digit index)", NULL },
+
     { "GlobalRouting",        "--GlobalRouting",        PT_BOOL,
       offsetof(config_t, global_routing),         0,
       BIT(12), 0,            0,
@@ -97,10 +103,10 @@ const param_def_t PARAMS[] = {
       BIT(16), MAX_PATH_LEN, 0,
       "<path>",                  "GeoSite .dat file (repeatable, replaces config)", NULL },
 
-    { "PolicyOrder",          "--PolicyOrder",          PT_POLICY_ORDER,
+    { "PolicyOrder",          "--PolicyOrder",          PT_NAME_LIST,
       offsetof(config_t, policy_order),
       offsetof(config_t, policy_order_count),
-      BIT(17), 64,           0,
+      BIT(17), MAX_POLICY_ORDER, 0,
       "<p1,p2,...>",             "Comma-separated policy priority order",      NULL    },
 
     { "l7CaptureEnabled",     "--l7CaptureEnabled",     PT_BOOL,
@@ -205,7 +211,7 @@ int param_apply(config_t *cfg, const param_def_t *p, const char *val, int strict
         return 0;
     }
 
-    case PT_POLICY_ORDER: {
+    case PT_NAME_LIST: {
         int *cnt = (int *)((char *)cfg + p->cfg_count_offset);
         char (*arr)[64] = (char (*)[64])field;
         char tmp[4096];
@@ -213,7 +219,7 @@ int param_apply(config_t *cfg, const param_def_t *p, const char *val, int strict
         tmp[sizeof(tmp) - 1] = '\0';
         char *saveptr;
         char *token = strtok_r(tmp, ",", &saveptr);
-        while (token && *cnt < MAX_POLICY_ORDER) {
+        while (token && *cnt < (int)p->buf_size) {
             char *t = trim_whitespace(token);
             if (t[0] != '\0') {
                 strncpy(arr[*cnt], t, 63);

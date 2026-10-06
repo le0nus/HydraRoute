@@ -292,6 +292,17 @@ static void add_unique_name(char names[][64], int *count, const char *name, int 
     }
 }
 
+static target_kind_t add_target(const char *name,
+                                char policy_names[][64], int *policy_count,
+                                char iface_names[][64], int *iface_count) {
+    target_kind_t kind = g_drm_active ? drm_classify_target(&g_drm, name) : TARGET_POLICY;
+    if (kind == TARGET_INTERFACE)
+        add_unique_name(iface_names, iface_count, name, MAX_INTERFACES);
+    else if (kind == TARGET_POLICY)
+        add_unique_name(policy_names, policy_count, name, MAX_POLICY_ORDER);
+    return kind;
+}
+
 int main(int argc, char *argv[]) {
     cli_args_t args;
     int ar = args_parse(argc, argv, &args);
@@ -388,12 +399,8 @@ int main(int argc, char *argv[]) {
         int pc_before = policy_count;
         char cidr_names[MAX_POLICY_ORDER][64];
         int cidr_count = parse_cidr_policy_headers(g_config.cidr_file_path, cidr_names, MAX_POLICY_ORDER);
-        for (int i = 0; i < cidr_count; i++) {
-            if (g_drm_active && drm_classify_target(&g_drm, cidr_names[i]))
-                add_unique_name(iface_names, &iface_count, cidr_names[i], MAX_INTERFACES);
-            else
-                add_unique_name(policy_names, &policy_count, cidr_names[i], MAX_POLICY_ORDER);
-        }
+        for (int i = 0; i < cidr_count; i++)
+            add_target(cidr_names[i], policy_names, &policy_count, iface_names, &iface_count);
         for (int i = pc_before; i < policy_count; i++)
             LOG_INFO("CIDR: added policy '%s'", policy_names[i]);
     }
@@ -409,12 +416,13 @@ int main(int argc, char *argv[]) {
     }
     {
         int pc_before = policy_count;
+        int kept = 0;
         for (int i = 0; i < gs_count; i++) {
-            if (g_drm_active && drm_classify_target(&g_drm, gs_rules[i].policy_name))
-                add_unique_name(iface_names, &iface_count, gs_rules[i].policy_name, MAX_INTERFACES);
-            else
-                add_unique_name(policy_names, &policy_count, gs_rules[i].policy_name, MAX_POLICY_ORDER);
+            if (add_target(gs_rules[i].policy_name, policy_names, &policy_count,
+                           iface_names, &iface_count) != TARGET_ABSENT_INTERFACE)
+                gs_rules[kept++] = gs_rules[i];
         }
+        gs_count = kept;
         for (int i = pc_before; i < policy_count; i++)
             LOG_INFO("GeoSite: added policy '%s'", policy_names[i]);
     }
@@ -453,7 +461,8 @@ int main(int argc, char *argv[]) {
             g_all_sorted[i].pair.ipv4[63] = 0;
             snprintf(g_all_sorted[i].pair.ipv6, sizeof(g_all_sorted[i].pair.ipv6),
                      "%.60sv6", all_names[i]);
-            g_all_sorted[i].is_interface = g_drm_active && drm_classify_target(&g_drm, all_names[i]);
+            g_all_sorted[i].is_interface = g_drm_active &&
+                drm_classify_target(&g_drm, all_names[i]) == TARGET_INTERFACE;
             g_all_sorted[i].fwmark = 0;
             if (g_all_sorted[i].is_interface) {
                 for (int r = 0; r < g_drm.route_count; r++) {

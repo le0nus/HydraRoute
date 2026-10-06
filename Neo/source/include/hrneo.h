@@ -83,6 +83,8 @@ typedef struct {
     int direct_route_enabled;
     int interface_fwmark_start;
     int interface_table_start;
+    char force_interfaces[MAX_INTERFACES][64];
+    int force_interface_count;
     int global_routing;
     int conntrack_flush;
     int ipset_maxelem;

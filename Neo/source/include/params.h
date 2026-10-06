@@ -16,7 +16,7 @@ typedef enum {
     PT_STRING,          /* fixed-size text buffer */
     PT_PATH,            /* STRING with buf_size = MAX_PATH_LEN */
     PT_REPEAT_PATH,     /* char[N][MAX_PATH_LEN] + count; --flag appends */
-    PT_POLICY_ORDER,    /* char[N][64] + count; single --flag, comma-split */
+    PT_NAME_LIST,       /* char[buf_size][64] + count; single --flag, comma-split */
 } param_type_t;
 
 typedef struct {

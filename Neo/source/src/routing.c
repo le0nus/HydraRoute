@@ -47,12 +47,30 @@ int drm_scan_interfaces(direct_route_manager_t *drm) {
     return 0;
 }
 
-int drm_classify_target(const direct_route_manager_t *drm, const char *name) {
+static int iface_pattern_match(const char *pattern, const char *name) {
+    size_t plen = strlen(pattern);
+    if (plen == 0 || pattern[plen - 1] != 'X') return strcmp(pattern, name) == 0;
+    plen--;
+    if (strncmp(pattern, name, plen) != 0 || name[plen] == '\0') return 0;
+    for (const char *c = name + plen; *c; c++)
+        if (*c < '0' || *c > '9') return 0;
+    return 1;
+}
+
+target_kind_t drm_classify_target(const direct_route_manager_t *drm, const char *name) {
     for (int i = 0; i < drm->interface_count; i++) {
         if (strcmp(drm->interfaces[i].name, name) == 0)
-            return 1;
+            return TARGET_INTERFACE;
     }
-    return 0;
+    const config_t *cfg = drm->config;
+    for (int i = 0; i < cfg->force_interface_count; i++) {
+        if (iface_pattern_match(cfg->force_interfaces[i], name)) {
+            LOG_INFO("Interface %s not present (ForceInterface=%s), target skipped",
+                     name, cfg->force_interfaces[i]);
+            return TARGET_ABSENT_INTERFACE;
+        }
+    }
+    return TARGET_POLICY;
 }
 
 int drm_allocate_fwmark(direct_route_manager_t *drm, const char *iface_name) {
@@ -360,7 +378,9 @@ typedef struct {
 
 static int classify_on_target(const char *target, void *user) {
     classify_ctx_t *cx = (classify_ctx_t *)user;
-    int is_interface = drm_classify_target(cx->drm, target);
+    target_kind_t kind = drm_classify_target(cx->drm, target);
+    if (kind == TARGET_ABSENT_INTERFACE) return 0;
+    int is_interface = kind == TARGET_INTERFACE;
     char (*list)[64] = is_interface ? cx->iface_names : cx->policy_names;
     int *count = is_interface ? cx->iface_count : cx->policy_count;
     int max = is_interface ? MAX_INTERFACES : MAX_POLICY_ORDER;

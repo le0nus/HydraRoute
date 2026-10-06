@@ -151,7 +151,7 @@ void args_apply(const cli_args_t *args, config_t *cfg) {
             break;
         }
 
-        case PT_POLICY_ORDER: {
+        case PT_NAME_LIST: {
             int n = *(const int *)((const char *)src + p->cfg_count_offset);
             memcpy(dst_field, src_field, (size_t)n * 64);
             *(int *)((char *)cfg + p->cfg_count_offset) = n;

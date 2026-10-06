@@ -119,7 +119,7 @@ int config_generate(const char *target) {
                     p->help_default ? p->help_default : "");
             break;
         case PT_REPEAT_PATH:
-        case PT_POLICY_ORDER:
+        case PT_NAME_LIST:
             fprintf(f, "%s=\n", p->config_key);
             break;
         }

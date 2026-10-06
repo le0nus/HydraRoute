@@ -1,5 +1,5 @@
 PROJECT = hrneo
-VERSION = 3.20.0-1
+VERSION = 3.21.0-1
 
 CC_MIPSEL   = mipsel-linux-muslsf-gcc
 CC_MIPS     = mips-linux-muslsf-gcc
@@ -87,6 +87,8 @@ check:
 	./build/check_watchlist
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_wlapi.c src/watchlist_api.c src/watchlist.c src/util.c src/log.c -o build/check_wlapi
 	./build/check_wlapi
+	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_routing.c src/routing.c src/watchlist.c src/util.c src/log.c -o build/check_routing
+	./build/check_routing
 
 clean:
 	rm -rf build/

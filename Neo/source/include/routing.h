@@ -3,9 +3,15 @@
 
 #include "hrneo.h"
 
+typedef enum {
+    TARGET_POLICY,
+    TARGET_INTERFACE,
+    TARGET_ABSENT_INTERFACE,
+} target_kind_t;
+
 void drm_init(direct_route_manager_t *drm, config_t *config);
 int drm_scan_interfaces(direct_route_manager_t *drm);
-int drm_classify_target(const direct_route_manager_t *drm, const char *name);
+target_kind_t drm_classify_target(const direct_route_manager_t *drm, const char *name);
 int drm_allocate_fwmark(direct_route_manager_t *drm, const char *iface_name);
 int drm_allocate_table_id(direct_route_manager_t *drm, const char *iface_name);
 void drm_register_route(direct_route_manager_t *drm, const char *iface_name,
