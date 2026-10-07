@@ -4,6 +4,8 @@
 #include "hrneo.h"
 #include <stdint.h>
 
+#define PKT_CAPTURE_BURST 64
+
 typedef void (*pkt_capture_cb)(const uint8_t *pkt, int pkt_len, void *user_data);
 
 typedef struct {

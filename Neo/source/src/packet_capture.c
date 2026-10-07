@@ -83,18 +83,22 @@ int pkt_capture_init(pkt_capture_t *cap, pkt_capture_cb cb, void *user_data) {
 }
 
 int pkt_capture_process(pkt_capture_t *cap, int fd) {
-    struct sockaddr_ll sll;
-    socklen_t sll_len = sizeof(sll);
-    ssize_t n = recvfrom(fd, cap->recv_buf, sizeof(cap->recv_buf), 0,
-                         (struct sockaddr *)&sll, &sll_len);
-    if (n < 0) {
-        if (errno == EINTR || errno == EAGAIN)
-            return 0;
-        LOG_ERROR("pkt_capture recv: %s", strerror(errno));
-        return -1;
+    /* Commits run in the same loop and answers queue up meanwhile: read what is
+     * there, but bounded so the other descriptors still get their turn. */
+    for (int i = 0; i < PKT_CAPTURE_BURST; i++) {
+        struct sockaddr_ll sll;
+        socklen_t sll_len = sizeof(sll);
+        ssize_t n = recvfrom(fd, cap->recv_buf, sizeof(cap->recv_buf), MSG_DONTWAIT,
+                             (struct sockaddr *)&sll, &sll_len);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                return 0;
+            LOG_ERROR("pkt_capture recv: %s", strerror(errno));
+            return -1;
+        }
+        if (n > 0 && cap->callback)
+            cap->callback(cap->recv_buf, (int)n, cap->user_data);
     }
-    if (n > 0 && cap->callback)
-        cap->callback(cap->recv_buf, (int)n, cap->user_data);
     return 0;
 }
 

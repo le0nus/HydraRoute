@@ -95,6 +95,8 @@ check:
 	./build/check_routing
 	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=send,--wrap=recv tests/check_ipset_refresh.c src/ipset_nl.c src/util.c src/log.c -o build/check_ipset_refresh
 	./build/check_ipset_refresh
+	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_packet_capture.c src/packet_capture.c src/log.c src/util.c -o build/check_packet_capture
+	./build/check_packet_capture
 
 clean:
 	rm -rf build/
