@@ -91,6 +91,8 @@ check:
 	./build/check_wlapi
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_routing.c src/routing.c src/watchlist.c src/util.c src/log.c -o build/check_routing
 	./build/check_routing
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=send,--wrap=recv tests/check_ipset_refresh.c src/ipset_nl.c src/util.c src/log.c -o build/check_ipset_refresh
+	./build/check_ipset_refresh
 
 clean:
 	rm -rf build/

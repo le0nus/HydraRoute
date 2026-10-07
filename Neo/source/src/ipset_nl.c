@@ -383,6 +383,9 @@ int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
             }
         }
 
+        int refresh[IPSET_CHUNK_SIZE];
+        int refresh_count = 0;
+
         for (int i = 0; i < msg_count; i++) {
             uint8_t resp[256];
             int n = recv(mgr->fd, resp, sizeof(resp), 0);
@@ -398,13 +401,25 @@ int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
                     }
                 } else {
                     int errcode = -err->error;
-                    if (errcode == IPSET_ERR_HASH_FULL) {
+                    if (errcode == IPSET_ERR_EXIST) {
+                        if (has_timeout && with_timeout) refresh[refresh_count++] = i;
+                    } else if (errcode == IPSET_ERR_HASH_FULL) {
                         LOG_WARN("ipset '%s' full (maxelem exceeded): set IpsetMaxElem in config", set_name);
-                    } else if (errcode != IPSET_ERR_EXIST) {
+                    } else {
                         LOG_DEBUG("Netlink ADD error: errno=%d", errcode);
                     }
                 }
             }
+        }
+
+        /* NLM_F_EXCL tells new IPs apart but also keeps the kernel from touching an
+         * existing entry, so live IPs expired IpsetTimeout after their first sighting. */
+        for (int r = 0; r < refresh_count; r++) {
+            struct nlmsghdr *h = (struct nlmsghdr *)msg_bufs[refresh[r]];
+            h->nlmsg_flags &= ~NLM_F_EXCL;
+            h->nlmsg_seq = mgr->seq++;
+            int rc = nl_send_recv_ack(mgr, msg_bufs[refresh[r]], msg_lens[refresh[r]]);
+            if (rc != 0) LOG_DEBUG("Netlink timeout refresh error: errno=%d", rc);
         }
     }
 
