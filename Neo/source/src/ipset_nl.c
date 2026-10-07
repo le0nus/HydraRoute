@@ -95,6 +95,8 @@ int ipset_manager_init(ipset_manager_t *mgr) {
 void ipset_manager_close(ipset_manager_t *mgr) {
     if (mgr->fd >= 0) close(mgr->fd);
     mgr->fd = -1;
+    ht_destroy(mgr->permanent);
+    mgr->permanent = NULL;
 }
 
 static int ipset_query_revision(ipset_manager_t *mgr, const char *type, int family) {
@@ -330,6 +332,35 @@ static int is_service_ip(const uint8_t *ip, int family) {
     return (memcmp(ip, zeros, 16) == 0 || memcmp(ip, loopback, 16) == 0);
 }
 
+/* CIDR lists add their entries without timeout, i.e. permanently. A host entry
+ * (/32, /128) is the same set element as a DNS-learned IP, and refreshing that
+ * IP would give it IpsetTimeout, so such entries are remembered per set. */
+static int permanent_key(char *key, const char *set_name_nul, int set_name_len,
+                         const parsed_cidr_t *entry) {
+    int ip_len = entry->family == AF_INET ? 4 : 16;
+    if (entry->prefix != (uint32_t)ip_len * 8) return 0;
+    memcpy(key, set_name_nul, set_name_len);
+    memcpy(key + set_name_len, entry->ip, ip_len);
+    return set_name_len + ip_len;
+}
+
+static void remember_permanent(ipset_manager_t *mgr, const char *set_name_nul,
+                               int set_name_len, const parsed_cidr_t *entry) {
+    char key[64 + 16];
+    int len = permanent_key(key, set_name_nul, set_name_len, entry);
+    if (len == 0) return;
+    if (!mgr->permanent && !(mgr->permanent = ht_create())) return;
+    ht_insert(mgr->permanent, key, len, "permanent");
+}
+
+static int is_permanent(const ipset_manager_t *mgr, const char *set_name_nul,
+                        int set_name_len, const parsed_cidr_t *entry) {
+    if (!mgr->permanent) return 0;
+    char key[64 + 16];
+    int len = permanent_key(key, set_name_nul, set_name_len, entry);
+    return len > 0 && ht_lookup(mgr->permanent, key, len) != NULL;
+}
+
 int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
                     const parsed_cidr_t *entries, int count,
                     int with_timeout, int *new_count, int *new_indices) {
@@ -394,15 +425,20 @@ int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
             struct nlmsghdr *nh = (struct nlmsghdr *)resp;
             if (nh->nlmsg_type == NLMSG_ERROR) {
                 struct nlmsgerr *err = (struct nlmsgerr *)((uint8_t *)nh + NLMSG_HDRLEN);
+                const parsed_cidr_t *entry = &entries[valid_indices[i]];
                 if (err->error == 0) {
                     if (with_timeout && new_indices) {
                         new_indices[*new_count] = valid_indices[i];
                         (*new_count)++;
+                    } else if (!with_timeout && has_timeout) {
+                        remember_permanent(mgr, set_name_nul, set_name_len, entry);
                     }
                 } else {
                     int errcode = -err->error;
                     if (errcode == IPSET_ERR_EXIST) {
-                        if (has_timeout && with_timeout) refresh[refresh_count++] = i;
+                        if (has_timeout && with_timeout &&
+                            !is_permanent(mgr, set_name_nul, set_name_len, entry))
+                            refresh[refresh_count++] = i;
                     } else if (errcode == IPSET_ERR_HASH_FULL) {
                         LOG_WARN("ipset '%s' full (maxelem exceeded): set IpsetMaxElem in config", set_name);
                     } else {

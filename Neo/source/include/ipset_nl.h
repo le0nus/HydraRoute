@@ -13,6 +13,7 @@ typedef struct {
     uint32_t default_timeout;
     char set_names[IPSET_MAX_SETS][64];
     int set_count;
+    domain_hashtable_t *permanent;  /* "set\0ip" of host entries added without timeout */
 } ipset_manager_t;
 
 int ipset_manager_init(ipset_manager_t *mgr);

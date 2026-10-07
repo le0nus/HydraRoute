@@ -66,6 +66,59 @@ int main(void) {
     assert(ipset_add_batch(&mgr, "HydraRoute", &e, 1, 0, &new_count, new_idx) == 0);
     assert(sent_count == 1);
 
+    /* A host entry from a CIDR list is permanent. A DNS answer for the same IP
+     * must not refresh it, or it would expire IpsetTimeout later. */
+    parsed_cidr_t host = e;
+    host.ip[0] = 198; host.ip[1] = 51; host.ip[2] = 100; host.ip[3] = 7;
+    reset();
+    assert(ipset_add_batch(&mgr, "HydraRoute", &host, 1, 0, &new_count, new_idx) == 0);
+    assert(sent_count == 1 && !(sent_flags[0] & NLM_F_EXCL));
+    reset();
+    replies[0] = IPSET_ERR_EXIST;
+    assert(ipset_add_batch(&mgr, "HydraRoute", &host, 1, 1, &new_count, new_idx) == 0);
+    assert(sent_count == 1 && new_count == 0);
+
+    /* In a set where the IP was learned from DNS it is still refreshed. */
+    reset();
+    replies[0] = IPSET_ERR_EXIST;
+    assert(ipset_add_batch(&mgr, "Other", &host, 1, 1, &new_count, new_idx) == 0);
+    assert(sent_count == 2);
+
+    /* A permanent network is a different element than a host inside it. */
+    parsed_cidr_t net = host, inside = host;
+    net.prefix = 24; net.ip[3] = 0;
+    inside.ip[3] = 8;
+    reset();
+    assert(ipset_add_batch(&mgr, "HydraRoute", &net, 1, 0, &new_count, new_idx) == 0);
+    reset();
+    replies[0] = IPSET_ERR_EXIST;
+    assert(ipset_add_batch(&mgr, "HydraRoute", &inside, 1, 1, &new_count, new_idx) == 0);
+    assert(sent_count == 2);
+
+    /* Same for IPv6 hosts. */
+    parsed_cidr_t host6;
+    memset(&host6, 0, sizeof(host6));
+    host6.family = AF_INET6;
+    host6.prefix = 128;
+    host6.ip[0] = 0x20; host6.ip[1] = 0x01; host6.ip[2] = 0x0d; host6.ip[3] = 0xb8; host6.ip[15] = 7;
+    reset();
+    assert(ipset_add_batch(&mgr, "HydraRoutev6", &host6, 1, 0, &new_count, new_idx) == 0);
+    reset();
+    replies[0] = IPSET_ERR_EXIST;
+    assert(ipset_add_batch(&mgr, "HydraRoutev6", &host6, 1, 1, &new_count, new_idx) == 0);
+    assert(sent_count == 1);
+
+    /* Without IpsetTimeout nothing is refreshed, so nothing is remembered. */
+    ipset_manager_t plain;
+    memset(&plain, 0, sizeof(plain));
+    reset();
+    assert(ipset_add_batch(&plain, "HydraRoute", &host, 1, 0, &new_count, new_idx) == 0);
+    assert(plain.permanent == NULL);
+
+    mgr.fd = -1;
+    ipset_manager_close(&mgr);
+    assert(mgr.permanent == NULL);
+
     puts("check_ipset_refresh: OK");
     return 0;
 }
