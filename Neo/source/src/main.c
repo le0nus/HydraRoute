@@ -10,6 +10,7 @@
 #include "../include/packet_capture.h"
 #include "../include/iptables.h"
 #include "../include/signal_handler.h"
+#include "../include/commit_sched.h"
 #include "../include/rci.h"
 #include "../include/conntrack.h"
 #include "../include/geodat.h"
@@ -44,7 +45,6 @@ static int g_l7_active;
 static char g_l7_wan[MAX_INTERFACE_NAME];
 static tcp_reasm_t g_reasm;
 static int g_reasm_active;
-static int g_commit_active;
 static const char *g_cfg_path = DEFAULT_CONFIG_PATH;
 static char g_policy_names[MAX_POLICY_ORDER][64];
 static int g_policy_names_count;
@@ -266,19 +266,17 @@ static int perform_update(void) {
 }
 
 static void commit_run(signal_mgr_t *m) {
-    if (perform_update() == 0) {
+    int delay = commit_sched_on_timer(perform_update);
+    if (delay == 0) {
         LOG_INFO("netfilter rules committed");
-        g_commit_active = 0;
         return;
     }
-    LOG_WARN("netfilter commit incomplete, retry in %d ms", NF_COMMIT_INTERVAL_MS);
-    signal_mgr_arm_timer(m, NF_COMMIT_INTERVAL_MS);
+    LOG_WARN("netfilter commit incomplete, retry in %d ms", delay);
+    signal_mgr_arm_timer(m, delay);
 }
 
 static void commit_start(signal_mgr_t *m) {
-    g_commit_active = 1;
-    perform_update();
-    signal_mgr_arm_timer(m, NF_COMMIT_INTERVAL_MS);
+    signal_mgr_arm_timer(m, commit_sched_on_signal(perform_update));
 }
 
 static void add_unique_name(char names[][64], int *count, const char *name, int max) {
@@ -668,12 +666,8 @@ int main(int argc, char *argv[]) {
                         LOG_INFO("Received signal %d, shutting down...", si.ssi_signo);
                         g_shutdown = 1;
                     } else if (si.ssi_signo == SIGUSR1) {
-                        if (g_commit_active) {
-                            LOG_DEBUG("SIGUSR1 ignored, commit cycle active");
-                        } else {
-                            LOG_DEBUG("SIGUSR1 received, committing now");
-                            commit_start(&signals);
-                        }
+                        LOG_DEBUG("SIGUSR1 received, committing now");
+                        commit_start(&signals);
                     }
                 }
             } else if (events[i].data.fd == signals.timer_fd) {
