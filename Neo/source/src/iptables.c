@@ -15,6 +15,7 @@ typedef struct {
     rule_state_t fam[2];
     char mark[16];
     int  gone;
+    int  warned, warned_r;
 } target_state_t;
 
 static const char *next_set_rule(const char **cursor, const char *pattern, size_t *len) {
@@ -182,7 +183,18 @@ static int resolve_mark(const unified_target_t *t, int need_rci, target_state_t 
     }
     if (!need_rci) return 0;
     int r = rci_get_policy_mark(t->pair.ipv4, ts->mark, sizeof(ts->mark));
-    if (r == RCI_MARK_OK) return 0;
+    if (r == RCI_MARK_OK) {
+        ts->warned = 0;
+        return 0;
+    }
+    if (r != RCI_MARK_TRANSPORT && r != RCI_MARK_DENIED) ts->gone = 1;
+    /* A failed commit is retried until this clears; WARN once per cause. */
+    if (ts->warned && ts->warned_r == r) {
+        LOG_DEBUG("Policy %s mark still unavailable (RCI result %d)", t->pair.ipv4, r);
+        return -1;
+    }
+    ts->warned = 1;
+    ts->warned_r = r;
     if (r == RCI_MARK_TRANSPORT) {
         LOG_WARN("RCI unreachable while reading policy %s", t->pair.ipv4);
     } else if (r == RCI_MARK_DENIED) {
@@ -190,7 +202,6 @@ static int resolve_mark(const unified_target_t *t, int need_rci, target_state_t 
                  t->pair.ipv4);
     } else {
         LOG_WARN("Policy %s has no mark ID yet", t->pair.ipv4);
-        ts->gone = 1;
     }
     return -1;
 }
@@ -230,7 +241,10 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
             broken[fi] = !st->xmark || !st->restore;
             if (!st->xmark) need_rci = 1;
         }
-        if (!startup_audit && !broken[0] && !broken[1]) continue;
+        if (!startup_audit && !broken[0] && !broken[1]) {
+            ts->warned = 0;
+            continue;
+        }
         if (resolve_mark(t, need_rci, ts) != 0) incomplete = 1;
 
         for (int fi = 0; fi < 2; fi++) {

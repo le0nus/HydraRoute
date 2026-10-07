@@ -79,7 +79,7 @@ check:
 	./build/check_commit_sched
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_nf.c src/l7_firewall.c src/util.c src/log.c -o build/check_nf
 	./build/check_nf
-	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=run_command_output,--wrap=run_command_stdin tests/check_connmark.c src/iptables.c src/l7_firewall.c src/util.c src/log.c -o build/check_connmark
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=run_command_output,--wrap=run_command_stdin,--wrap=log_write tests/check_connmark.c src/iptables.c src/l7_firewall.c src/util.c src/log.c -o build/check_connmark
 	./build/check_connmark
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_rci.c src/util.c src/log.c src/config.c src/params.c -o build/check_rci
 	./build/check_rci

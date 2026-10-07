@@ -8,7 +8,7 @@
 
 static char table[2][MAX_LINES][256];
 static int  table_len[2];
-static int  restores, rci_calls, rci_absent;
+static int  restores, rci_calls, rci_absent, warns;
 
 static int family_of(const char *cmd) {
     return strncmp(cmd, "ip6", 3) == 0;
@@ -65,6 +65,10 @@ int __wrap_run_command_stdin(const char *cmd, char *const argv[], const char *in
     return 0;
 }
 
+void __wrap_log_write(const char *fmt, ...) {
+    if (strncmp(fmt, "[WARN]", 6) == 0) warns++;
+}
+
 int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
     rci_calls++;
     if (rci_absent) return RCI_MARK_ABSENT;
@@ -75,6 +79,7 @@ int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
 static void reset_counters(void) {
     restores = 0;
     rci_calls = 0;
+    warns = 0;
 }
 
 static void assert_family_order(int fi, int base, const char *ru, const char *hr) {
@@ -131,18 +136,30 @@ int main(void) {
     assert(restores == 1 && rci_calls == 0);
     assert_policy_order();
 
+    /* Commits are retried while the mark is missing; the cause is a WARN only once. */
     reset_counters();
     rci_absent = 1;
     table_remove_matching(0, "--match-set RU dst ", NULL);
-    for (int pass = 0; pass < 2; pass++)
+    for (int pass = 0; pass < 3; pass++)
         assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == -1);
-    assert(restores == 1 && rci_calls == 2);
+    assert(restores == 1 && rci_calls == 3);
+    assert(warns == 1);
     assert(table_len[0] == 3 && table_len[1] == 2);
 
     reset_counters();
     rci_absent = 0;
     assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == 0);
     assert(restores == 2 && rci_calls == 1);
+    assert_policy_order();
+
+    /* Once the policy works again, a new failure is reported again. */
+    reset_counters();
+    rci_absent = 1;
+    table_remove_matching(0, "--match-set RU dst ", NULL);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == -1);
+    assert(warns == 1);
+    rci_absent = 0;
+    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == 0);
     assert_policy_order();
 
     puts("check_connmark: OK");
