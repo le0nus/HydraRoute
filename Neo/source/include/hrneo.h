@@ -12,7 +12,6 @@
 #define IPSET_HASH_TYPE           "hash:net"
 #define SOCKET_READ_BUFFER        (1024 * 1024)
 #define NF_VERIFY_INTERVAL_MS     250
-#define NF_RETRY_INTERVAL_MS      500
 #define RCI_TIMEOUT_SEC           10
 #define IPSET_CHUNK_SIZE          256
 #define IPSET_DEFAULT_MAXELEM     262144

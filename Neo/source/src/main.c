@@ -49,6 +49,7 @@ static const char *g_cfg_path = DEFAULT_CONFIG_PATH;
 static char g_policy_names[MAX_POLICY_ORDER][64];
 static int g_policy_names_count;
 static int g_policies_pending;
+static commit_sched_t g_commit;
 
 static int create_pid_file(const char *path) {
     FILE *f = fopen(path, "r");
@@ -265,18 +266,31 @@ static int perform_update(void) {
                                         g_l7_active ? g_l7_wan : NULL);
 }
 
+/* WARN is always logged, so a lasting failure gets one line when it starts and
+ * one when it ends; the retries in between go to DEBUG. */
+static void commit_log(int delay) {
+    if (g_commit.event == COMMIT_EV_FAILED)
+        LOG_WARN("netfilter commit incomplete, retry in %d ms, backing off to 3 s", delay);
+    else if (g_commit.event == COMMIT_EV_RECOVERED)
+        LOG_WARN("netfilter rules committed after %d failed attempts", g_commit.failures);
+    else if (g_commit.failing)
+        LOG_DEBUG("netfilter commit incomplete, retry in %d ms", delay);
+}
+
 static void commit_run(signal_mgr_t *m) {
-    int delay = commit_sched_on_timer(perform_update);
+    int delay = commit_sched_on_timer(&g_commit, perform_update);
+    commit_log(delay);
     if (delay == 0) {
-        LOG_INFO("netfilter rules committed");
+        if (g_commit.event == COMMIT_EV_NONE) LOG_INFO("netfilter rules committed");
         return;
     }
-    LOG_WARN("netfilter commit incomplete, retry in %d ms", delay);
     signal_mgr_arm_timer(m, delay);
 }
 
 static void commit_start(signal_mgr_t *m) {
-    signal_mgr_arm_timer(m, commit_sched_on_signal(perform_update));
+    int delay = commit_sched_on_signal(&g_commit, perform_update);
+    commit_log(delay);
+    signal_mgr_arm_timer(m, delay);
 }
 
 static void add_unique_name(char names[][64], int *count, const char *name, int max) {
