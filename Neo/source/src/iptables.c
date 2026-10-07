@@ -321,9 +321,11 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
         if (fam->rule_count == 0) continue;
         if (batch_append(fam, "COMMIT\n") != 0) return -1;
         char *argv[] = {(char *)fam->restore_cmd, "--noflush", NULL};
-        int ret = run_command_stdin(fam->restore_cmd, argv, fam->batch, fam->off);
+        char err[160];
+        int ret = run_command_stdin(fam->restore_cmd, argv, fam->batch, fam->off,
+                                    err, sizeof(err));
         if (ret != 0) {
-            LOG_WARN("%s failed (exit %d)", fam->restore_cmd, ret);
+            LOG_WARN("%s failed (exit %d)%s%s", fam->restore_cmd, ret, err[0] ? ": " : "", err);
             return -1;
         }
         LOG_DEBUG("Committed %d rule groups via %s", fam->rule_count, fam->restore_cmd);

@@ -15,7 +15,8 @@ void to_lower_inplace(char *s, size_t len);
 char *trim_whitespace(char *s);
 int mkdir_p(const char *path, int mode);
 int run_command_output(const char *cmd, char *const argv[], char *output, size_t output_size);
-int run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t input_len);
+int run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t input_len,
+                      char *err, size_t err_size);
 const char *line_find(const char *line, size_t line_len, const char *needle);
 
 #endif

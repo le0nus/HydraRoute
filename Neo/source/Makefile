@@ -97,6 +97,8 @@ check:
 	./build/check_ipset_refresh
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_packet_capture.c src/packet_capture.c src/log.c src/util.c -o build/check_packet_capture
 	./build/check_packet_capture
+	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_run_command.c src/util.c -o build/check_run_command
+	./build/check_run_command
 
 clean:
 	rm -rf build/

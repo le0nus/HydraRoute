@@ -1,6 +1,7 @@
 #include "../include/iptables.h"
 #include "../include/util.h"
 #include <assert.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -9,6 +10,8 @@
 static char table[2][MAX_LINES][256];
 static int  table_len[2];
 static int  restores, rci_calls, rci_absent, warns;
+static const char *restore_error;
+static char last_warn[256];
 
 static int family_of(const char *cmd) {
     return strncmp(cmd, "ip6", 3) == 0;
@@ -44,9 +47,12 @@ int __wrap_run_command_output(const char *cmd, char *const argv[], char *output,
     return 0;
 }
 
-int __wrap_run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t len) {
+int __wrap_run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t len,
+                             char *err, size_t err_size) {
     int fi = family_of(cmd);
     restores++;
+    snprintf(err, err_size, "%s", restore_error ? restore_error : "");
+    if (restore_error) return 1;
     char buf[IPT_BATCH_SIZE];
     memcpy(buf, input, len);
     buf[len] = '\0';
@@ -66,7 +72,12 @@ int __wrap_run_command_stdin(const char *cmd, char *const argv[], const char *in
 }
 
 void __wrap_log_write(const char *fmt, ...) {
-    if (strncmp(fmt, "[WARN]", 6) == 0) warns++;
+    if (strncmp(fmt, "[WARN]", 6) != 0) return;
+    warns++;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(last_warn, sizeof(last_warn), fmt, ap);
+    va_end(ap);
 }
 
 int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
@@ -159,6 +170,18 @@ int main(void) {
     assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == -1);
     assert(warns == 1);
     rci_absent = 0;
+    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == 0);
+    assert_policy_order();
+
+    /* A failed restore reports what iptables-restore said, and the next commit
+     * starts over from a fresh dump. */
+    reset_counters();
+    restore_error = "iptables-restore: line 3 failed";
+    table_remove_matching(0, "--match-set RU dst ", NULL);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == -1);
+    assert(warns == 1);
+    assert(strstr(last_warn, "iptables-restore failed (exit 1): iptables-restore: line 3 failed"));
+    restore_error = NULL;
     assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == 0);
     assert_policy_order();
 

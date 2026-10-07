@@ -182,25 +182,38 @@ const char *line_find(const char *line, size_t line_len, const char *needle) {
     return NULL;
 }
 
-int run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t input_len) {
-    int pipefd[2];
+/* Stdout is dropped; the first line of stderr is kept in err, since that is
+ * where iptables-restore says which line failed. */
+int run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t input_len,
+                      char *err, size_t err_size) {
+    if (err_size > 0) err[0] = '\0';
+    int pipefd[2], errfd[2];
     if (pipe(pipefd) < 0) return -1;
-
-    pid_t pid = fork();
-    if (pid < 0) {
+    if (pipe(errfd) < 0) {
         close(pipefd[0]);
         close(pipefd[1]);
         return -1;
     }
 
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(errfd[0]);
+        close(errfd[1]);
+        return -1;
+    }
+
     if (pid == 0) {
         close(pipefd[1]);
+        close(errfd[0]);
         dup2(pipefd[0], STDIN_FILENO);
         close(pipefd[0]);
+        dup2(errfd[1], STDERR_FILENO);
+        close(errfd[1]);
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) {
             dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
             close(devnull);
         }
         execvp(cmd, argv);
@@ -208,6 +221,7 @@ int run_command_stdin(const char *cmd, char *const argv[], const char *input, si
     }
 
     close(pipefd[0]);
+    close(errfd[1]);
     size_t written = 0;
     while (written < input_len) {
         ssize_t n = write(pipefd[1], input + written, input_len - written);
@@ -215,6 +229,18 @@ int run_command_stdin(const char *cmd, char *const argv[], const char *input, si
         written += n;
     }
     close(pipefd[1]);
+
+    size_t total = 0;
+    ssize_t n;
+    while (total + 1 < err_size && (n = read(errfd[0], err + total, err_size - 1 - total)) > 0)
+        total += n;
+    if (err_size > 0) {
+        err[total] = '\0';
+        err[strcspn(err, "\n")] = '\0';
+    }
+    char sink[512];
+    while (read(errfd[0], sink, sizeof(sink)) > 0) {}
+    close(errfd[0]);
 
     int status;
     waitpid(pid, &status, 0);
