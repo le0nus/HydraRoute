@@ -66,7 +66,8 @@
 |----------|----------|------------|
 | `RCI_RAW_MAX` | 32 КБ | Статический приёмный буфер `rci_request_ex` (`src/rci.c`); ответ точечного GET — десятки байт |
 | `RCI_TIMEOUT_SEC` | 10 | `SO_RCVTIMEO` / `SO_SNDTIMEO` |
-| `NF_COMMIT_INTERVAL_MS` | 3000 | Пауза между попытками коммита netfilter; SIGUSR1 в этом окне игнорируются |
+| `NF_VERIFY_INTERVAL_MS` | 250 | Подтверждающий коммит netfilter после успешного коммита по SIGUSR1 |
+| `retry_ms[]` | 50…3000 | Паузы повтора неудачного коммита (`src/commit_sched.c`): 50, 100, 250, 500, 1000 мс, дальше каждые 3 с |
 | `IPT_DUMP_SIZE` | 65536 | Буфер дампа `iptables -t mangle -S <chain>` (PREROUTING + FORWARD/OUTPUT при L7) на семью |
 | `IPT_BATCH_SIZE` | 65536 | Буфер batch для `iptables-restore` на семью; при перестройке в нём и `-D`, и `-A` всех целей |
 | `IPT_MAX_RULE_ARGS` | 64 | Максимум argv-токенов при удалении правила |

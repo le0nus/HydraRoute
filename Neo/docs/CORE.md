@@ -61,9 +61,9 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
 12. **Извлечение `markID` политик через RCI** + создание `CONNMARK`-правил `iptables` (`apply_unified_connmark_rules`, подробно — раздел [8](#8-маршрутизация-и-маркировка)):
     - Точечный `GET /rci/show/ip/policy/<Name>/mark` возвращает голое значение `"ffffaaa"` (~10 байт; HTTP 404 — политики нет). Полное дерево политик со всеми маршрутами не выкачивается, JSON-парсер не нужен — из ответа снимаются кавычки и префикс `0x`. Лог при `log=console/file`: `[DEBUG] RCI policy: HydraRoute mark=0xffffaaa`
     - Запрос идёт для каждой цели-политики только на стартовой сверке (`startup_audit`, до первого успешного коммита): марки в правилах сверяются с RCI, осиротевшие правила исчезнувших политик удаляются. Дальше RCI опрашивается лениво — только для целей, у которых в таблице нет правил
-    - Ретрая внутри RCI-клиента нет: и сетевая ошибка, и «политика создана, но `markID` ещё не назначен» дают `-1` из `apply_unified_connmark_rules`, а повтор обеспечивает коммитер (`commit_run`, фиксированные `NF_COMMIT_INTERVAL_MS` = 3 с, без роста интервала, бесконечно). Один механизм ожидания вместо трёх вложенных, и он не блокирует epoll-цикл
+    - Ретрая внутри RCI-клиента нет: и сетевая ошибка, и «политика создана, но `markID` ещё не назначен» дают `-1` из `apply_unified_connmark_rules`, а повтор обеспечивает коммитер (`commit_run`, паузы 50 → 100 → 250 → 500 → 1000 мс, дальше каждые 3 с, бесконечно; раздел [9](#9-обработчик-сигналов-srcsignal_handlerc)). Один механизм ожидания вместо трёх вложенных, и он не блокирует epoll-цикл
     - Для целей-интерфейсов `markID` не запрашивается — используется назначенный `fwmark`
-    - Для каждой цели в порядке `g_all_sorted[]` формируется пара `CONNMARK`-правил в `mangle/PREROUTING`, через `iptables-restore --noflush` (один вызов на весь батч). Если марку получить не удалось (RCI недоступен, авторизация отклонена, политики нет или `markID` ещё не назначен) — `LOG_WARN`, цель пропускается в этом батче и выставляется `incomplete=1`: остальные цели применяются, но функция возвращает `-1` (`ipset` продолжит заполняться, но трафик этой цели не маркируется до следующего коммита)
+    - Для каждой цели в порядке `g_all_sorted[]` формируется пара `CONNMARK`-правил в `mangle/PREROUTING`, через `iptables-restore --noflush` (один вызов на весь батч). Если марку получить не удалось (RCI недоступен, авторизация отклонена, политики нет или `markID` ещё не назначен) — `LOG_WARN` (один раз на цель и причину, повторы — `LOG_DEBUG`), цель пропускается в этом батче и выставляется `incomplete=1`: остальные цели применяются, но функция возвращает `-1` (`ipset` продолжит заполняться, но трафик этой цели не маркируется до следующего коммита)
 
 13. Инициализируется `AF_PACKET` захват DNS-ответов: два `SOCK_DGRAM/ETH_P_ALL` сокета с L3-BPF (`fd4` для IPv4, `fd6` для IPv6).
 
@@ -76,7 +76,7 @@ HRNeo — демон для policy routing на роутерах Keenetic (Entwa
 16. Если `ConntrackFlush=true` И IP добавлен в `ipset` впервые (`NLM_F_EXCL` вернул `err==0`, а не `IPSET_ERR_EXIST`), IP попадает в pending-буфер `conntrack_flush_request` — conntrack-DUMP выполняется **асинхронно**: неблокирующий сокет `m->fd` зарегистрирован в том же epoll, чанки таблицы читаются между DNS-пакетами, DELETE по совпадению dst-IP уходит fire-and-forget. DNS-события никогда не ждут сканирования таблицы (при burst-резолвах ipset add всех доменов завершается до/независимо от DUMP'а), один DUMP обслуживает все накопленные IP. Реальное удаление происходит только при наличии активной `conntrack`-записи к IP; если соединения ещё нет — DUMP проходит вхолостую.
 
 17. Обрабатываются сигналы:
-    - `SIGUSR1` — обновление состояния интерфейсов DirectRoute + восстановление недостающих `CONNMARK`-правил (RCI опрашивается только для целей без правил) + недостающих L7-правил. Правила hrneo пишутся одной командой `iptables-restore --noflush` на семью; идемпотентность — по дампу только разбираемых цепочек (`-S PREROUTING`, при L7 ещё `-S FORWARD`/`-S OUTPUT`), без `iptables -C`. При неактивном цикле коммита запись выполняется **немедленно**, подтверждающая — через `NF_COMMIT_INTERVAL_MS` = 3 с; пока цикл активен, сигналы игнорируются целиком (`timerfd`)
+    - `SIGUSR1` — обновление состояния интерфейсов DirectRoute + восстановление недостающих `CONNMARK`-правил (RCI опрашивается только для целей без правил) + недостающих L7-правил. Правила hrneo пишутся одной командой `iptables-restore --noflush` на семью; идемпотентность — по дампу только разбираемых цепочек (`-S PREROUTING`, при L7 ещё `-S FORWARD`/`-S OUTPUT`), без `iptables -C`. Каждый сигнал выполняет запись **немедленно**, подтверждающая — через `NF_VERIFY_INTERVAL_MS` = 250 мс после последнего сигнала; неудачная запись повторяется через 50 мс с ростом паузы до 3 с (`timerfd`, раздел 9)
     - `SIGINT`/`SIGTERM` — штатная остановка: остановка потока watchlist API и удаление сокета, снятие L7 `NFLOG`-правил, удаление `CONNMARK`, удаление `ip rule` + flush таблиц DirectRoute, закрытие netlink-сокетов, удаление PID-файла
 
 ### Архитектурная схема (DNS-канал)
@@ -116,7 +116,7 @@ DNS-ответ (ndnproxy и др.) → клиент (любой интерфей
    → ip rule fwmark → table X → default via <gw> dev <interface>
 ```
 
-### Файловая структура (26 файлов `.c`)
+### Файловая структура (27 файлов `.c`)
 
 | Файл | Назначение |
 |------|------------|
@@ -135,6 +135,7 @@ DNS-ответ (ndnproxy и др.) → клиент (любой интерфей
 | `src/util.c` | Хеш-таблица доменов, chunked pool, fork/exec |
 | `src/rci.c` | HTTP/JSON взаимодействие с API Keenetic |
 | `src/signal_handler.c` | `signal_mgr_t` (signalfd + timerfd manager) |
+| `src/commit_sched.c` | Политика коммитов netfilter: немедленный по SIGUSR1, подтверждающий через 250 мс, повторы с ростом паузы 50 мс → 3 с |
 | `src/geodat.c` | Парсинг GeoIP/GeoSite .dat файлов (protobuf) |
 | `src/probe_tls.c` | Stateless парсер TLS ClientHello → SNI |
 | `src/probe_http.c` | Stateless парсер HTTP request → Host |
@@ -164,7 +165,7 @@ DNS-ответ (ndnproxy и др.) → клиент (любой интерфей
 | `DEFAULT_API_PORT` | `79` | порт RCI |
 | `IPSET_HASH_TYPE` | `"hash:net"` | тип создаваемых ipset |
 | `SOCKET_READ_BUFFER` | 1 МБ | `SO_RCVBUF` для AF_PACKET |
-| `NF_COMMIT_INTERVAL_MS` | `3000` | пауза между попытками коммита; в ней SIGUSR1 игнорируются |
+| `NF_VERIFY_INTERVAL_MS` | `250` | подтверждающий коммит после успешного коммита по SIGUSR1 |
 | `RCI_TIMEOUT_SEC` | `10` | таймаут RCI-запроса |
 | `IPSET_CHUNK_SIZE` | `256` | размер батча ipset |
 | `IPSET_DEFAULT_MAXELEM` | `262144` | fallback при `IpsetMaxElem=0` в `add_cidr_to_ipsets` |
@@ -205,11 +206,11 @@ int                     g_l7_active;
 char                    g_l7_wan[MAX_INTERFACE_NAME];
 tcp_reasm_t             g_reasm;
 int                     g_reasm_active;
-int                     g_commit_active;            // цикл коммитера netfilter активен
 const char             *g_cfg_path = DEFAULT_CONFIG_PATH;
 char                    g_policy_names[MAX_POLICY_ORDER][64];
 int                     g_policy_names_count;
 int                     g_policies_pending;         // rci_create_policies не прошёл — повтор на коммите
+commit_sched_t          g_commit;                   // состояние повторов коммитера netfilter
 ```
 
 ### `main()` — последовательность старта
@@ -247,7 +248,7 @@ int                     g_policies_pending;         // rci_create_policies не 
 22. `signal_mgr_init()` — `sigprocmask` + `signalfd` + `timerfd`
 23. `epoll_create1()` — регистрация `cap.fd4`, `cap.fd6`, `signals.sig_fd`, `signals.timer_fd`; при активном conntrack flush — `g_conntrack.fd` (async DUMP); при `g_l7_active` — `nflog_fd`; при `g_reasm_active` — `reasm_gc_fd` (`timerfd` 1s)
 23a. `wlapi_start(WATCHLIST_SOCKET, g_all_targets)` — сокет watchlist API и его поток (раздел 20). Последний шаг инициализации: к этому моменту watchlist загружен полностью. При ошибке — `LOG_WARN`, демон работает без API
-24. `commit_start()` — первый коммит netfilter (тот же путь, что и по SIGUSR1, с тем же ретраем через фиксированные 3 с)
+24. `commit_start()` — первый коммит netfilter (тот же путь, что и по SIGUSR1, с тем же ретраем: 50 мс с ростом паузы до 3 с)
 25. Основной цикл `epoll_wait` (`events[8]`)
 26. **Cleanup:** `wlapi_stop` (поток API останавливается до `ht_destroy`) → `signal_mgr_close` → `l7_firewall_remove` + `nflog_capture_close` → `tcp_reasm_close` (если `g_reasm_active`) → `pkt_capture_close` → `conntrack_mgr_close` → `drm_cleanup_all_routes` → `cleanup_connmark_rules` → `ipset_manager_close` → `ht_destroy` → `remove_pid_file` → `log_close`
 
@@ -293,7 +294,7 @@ int                     g_policies_pending;         // rci_create_policies не 
 
 ### `pkt_capture_process(cap, fd)`
 
-- `recvfrom()` с `sockaddr_ll` (адресный буфер; `sll_hatype` не анализируется)
+- `recvfrom(MSG_DONTWAIT)` с `sockaddr_ll` (адресный буфер; `sll_hatype` не анализируется) в цикле: за одно пробуждение epoll читается всё накопившееся, но не больше `PKT_CAPTURE_BURST` = 64 пакетов, чтобы остальные дескрипторы цикла не ждали
 - При `SOCK_DGRAM` канального заголовка нет ни для одного типа интерфейса → смещение не вычисляется, callback вызывается с `recv_buf` (IP-пакет со смещения 0)
 
 ### `pkt_capture_close(cap)`
@@ -463,7 +464,7 @@ struct pool_chunk {
 - `fnv1a_hash()` — inline в `hrneo.h`
 - `mkdir_p()` — рекурсивное создание каталогов
 - `run_command_output()` — `fork`/`execvp` с захватом `stdout`+`stderr`
-- `run_command_stdin()` — `fork`/`execvp` с подачей `stdin`
+- `run_command_stdin()` — `fork`/`execvp` с подачей `stdin`; первая строка `stderr` возвращается в буфере `err`
 
 ---
 
@@ -478,6 +479,7 @@ struct pool_chunk {
 | `default_timeout` | единый timeout (сек) для DNS-path ADD всех сетов; 0 = без timeout. Устанавливается в `main` из `IpsetEnableTimeout`/`IpsetTimeout` |
 | `set_names[IPSET_MAX_SETS=512][64]` | кэш имён существующих ipset |
 | `set_count` | количество кэшированных имён |
+| `permanent` | `domain_hashtable_t` с ключом `<сет>\0<IP>`: хостовые записи (`/32`, `/128`), добавленные без timeout; создаётся лениво, только при `default_timeout > 0` |
 
 ### `ipset_create(mgr, name, type, family, timeout, maxelem)`
 
@@ -498,13 +500,14 @@ struct pool_chunk {
 2. Фильтрует service IP через `is_service_ip()` (`LOG_FILTERED`)
 3. Формирует netlink-сообщения через `build_ipset_add_msg()`: `TIMEOUT`-атрибут добавляется при `has_timeout=1`; значение = `default_timeout` при `with_timeout=true`, иначе явный `0` (постоянная запись CIDR-пути)
 4. Чанки по `IPSET_CHUNK_SIZE=256`: send все сообщения чанка, затем recv все ответы
-5. `with_timeout=true`: `NLM_F_EXCL` (повторное добавление → `IPSET_ERR_EXIST` без обновления `timeout`); `new_indices` заполняется только при `with_timeout=true`
-6. `with_timeout=false`: `NLM_F_CREATE` без `NLM_F_EXCL`; `new_indices` не заполняется
+5. `with_timeout=true`: `NLM_F_EXCL` — так новый IP отличается от известного (повторное добавление → `IPSET_ERR_EXIST`, `timeout` ядро при этом не трогает); `new_indices` заполняется только при `with_timeout=true`
+6. `with_timeout=false`: `NLM_F_CREATE` без `NLM_F_EXCL`; `new_indices` не заполняется; при `has_timeout=1` хостовые записи (`/32`, `/128`) запоминаются в `permanent`
 7. Обработка ошибок netlink ack:
    - `err->error == 0` → запись добавлена, индекс пишется в `new_indices` при `with_timeout=1`
    - `IPSET_ERR_HASH_FULL` (4101) → `LOG_WARN "ipset '%s' full"`
-   - `IPSET_ERR_EXIST` (4103) → молча игнорируется
+   - `IPSET_ERR_EXIST` (4103) → при `has_timeout=1` и `with_timeout=1` запись идёт на продление (п. 8), иначе молча игнорируется
    - Прочие коды → `LOG_DEBUG "Netlink ADD error: errno=%d"`
+8. **Продление timeout.** После ответов чанка каждое сообщение, получившее `IPSET_ERR_EXIST`, отправляется ещё раз без `NLM_F_EXCL`: ядро перезаписывает `timeout` записи на `default_timeout`, и IP, который продолжают резолвить, живёт `IpsetTimeout` после **последнего** ответа, а не после первого. В `new_indices` такие IP не попадают — conntrack не трогается. Не продлеваются записи из `permanent`: хост из CIDR/GeoIP — тот же элемент сета, и продление сделало бы постоянную запись истекающей
 
 ### Прочие функции
 
@@ -530,10 +533,10 @@ struct pool_chunk {
 3. markID запрашивается **лениво**: только если строки `--set-xmark` хотя бы в одном семействе нет — либо если идёт `startup_audit`, режим первого успешного коммита. Интерфейсные цели RCI не используют вовсе (`mark = fwmark`). Если все цели целы и аудит уже пройден, сетевых вызовов нет и `iptables-restore` не запускается
    - `RCI_MARK_TRANSPORT` / `RCI_MARK_DENIED` → `incomplete=1`; уже стоящие правила цели сохраняются со своей маркой
    - `RCI_MARK_ABSENT` → `incomplete=1`, оставшиеся правила цели удаляются как осиротевшие: политики уже нет, а её markID Keenetic выдаст следующей созданной политике (docs/MARKID_DRIFT.md)
-4. **Перестройка семейства в порядке `PolicyOrder`.** Правила добавляются через `-A`, то есть в конец цепочки, поэтому дописать одну недостающую цель значит поставить её ниже всех остальных и нарушить приоритет. Если в семействе нарушена хотя бы одна цель (нет обеих строк или одной из них) и её правила можно восстановить (марка известна из RCI, `fwmark` или уцелевшей строки `--set-xmark`), семейство перестраивается целиком: в batch сначала идут `-D` на каждую строку правил hrneo из дампа, затем `-A` для всех целей в порядке `g_all_sorted[]`. Это один вызов `iptables-restore --noflush`, поэтому замена атомарна: окна без правил нет. Чужие правила цепочки не трогаются. При `startup_audit` перестраиваются оба семейства, заодно сверяются марки с RCI и исправляется порядок, оставшийся от прошлых запусков. Цель, которую добавить нельзя (RCI недоступен, политики нет), перестройку не запускает, иначе коммитер гонял бы её каждые 3 с вхолостую
+4. **Перестройка семейства в порядке `PolicyOrder`.** Правила добавляются через `-A`, то есть в конец цепочки, поэтому дописать одну недостающую цель значит поставить её ниже всех остальных и нарушить приоритет. Если в семействе нарушена хотя бы одна цель (нет обеих строк или одной из них) и её правила можно восстановить (марка известна из RCI, `fwmark` или уцелевшей строки `--set-xmark`), семейство перестраивается целиком: в batch сначала идут `-D` на каждую строку правил hrneo из дампа, затем `-A` для всех целей в порядке `g_all_sorted[]`. Это один вызов `iptables-restore --noflush`, поэтому замена атомарна: окна без правил нет. Чужие правила цепочки не трогаются. При `startup_audit` перестраиваются оба семейства, заодно сверяются марки с RCI и исправляется порядок, оставшийся от прошлых запусков. Цель, которую добавить нельзя (RCI недоступен, политики нет), перестройку не запускает, иначе коммитер гонял бы её на каждом повторе вхолостую
 5. Если L7 активен — `l7_firewall_emit_rules()` дописывает недостающие NFLOG-правила `FORWARD`/`OUTPUT` **в тот же batch** (наличие определяется по тому же дампу)
-6. Каждый непустой batch → один вызов `iptables-restore --noflush` / `ip6tables-restore --noflush`. Ненулевой код возврата или переполнение batch → `-1`
-7. Возврат: `0` — таблица приведена в целевое состояние полностью; `-1` — коммитер повторит через 3 с
+6. Каждый непустой batch → один вызов `iptables-restore --noflush` / `ip6tables-restore --noflush`. Ненулевой код возврата (`[WARN] ... failed (exit N): <первая строка stderr>`) или переполнение batch → `-1`
+7. Возврат: `0` — таблица приведена в целевое состояние полностью; `-1` — коммитер повторит (через 50 мс, дальше с ростом паузы до 3 с)
 
 #### Правила CONNMARK (`GlobalRouting=false`)
 
@@ -677,41 +680,40 @@ ip -4|-6 route   replace blackhole default table <tableID>    # если DOWN
 
 - `sigprocmask(SIG_BLOCK, ...)` повторно (`main` уже блокирует) — защита
 - `signalfd(SFD_CLOEXEC)` → `m->sig_fd`
-- `timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC)` → `m->timer_fd`
+- `timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK)` → `m->timer_fd`
 
 ### Прочие функции
 
 - `signal_mgr_close(m)` — close обоих `fd`
 - `signal_mgr_arm_timer(m, milliseconds)` — one-shot через `timerfd_settime`
-- `signal_mgr_read_timer(m)` — `read()` expirations
+- `signal_mgr_read_timer(m)` — неблокирующий `read()` expirations; `-1`, если читать нечего
 
-`arm_timer` вызывается только из `commit_start`/`commit_run`, то есть либо при
-неактивном цикле, либо сразу после `read_timer`. Обработчик сигнала таймер не
-трогает, поэтому взвести уже сработавший, но ещё не прочитанный таймер нельзя —
-блокирующий `read(timer_fd)` не может залипнуть.
+`arm_timer` вызывается из `commit_start` (на каждый SIGUSR1) и `commit_run`.
+Сигнал может перевзвести таймер, который уже сработал, но ещё не прочитан в этом
+проходе epoll: перевзвод сбрасывает счётчик срабатываний, и блокирующий `read`
+ждал бы весь новый интервал. Поэтому `timer_fd` неблокирующий, а `commit_run`
+вызывается, только если `read_timer` вернул `> 0`.
 
 ### Логика обработки (`main.c`, epoll loop)
 
-Коммитер netfilter — leading-edge цикл на одном `timer_fd`. Требование NDMS
-(см. `NETFILTER_RACE.md`): накапливать вызовы `netfilter.d`, повторять при
-любой ошибке записи. Ключевое ограничение сверху — задержка первой записи:
-пока правил нет, а IP уже в ipset, новые соединения устанавливаются с маркой 0
-и уходят мимо целевой политики навсегда (conntrack держит их до закрытия).
-Поэтому первая запись выполняется без задержки.
+Коммитер netfilter — один `timer_fd` и политика повторов в `src/commit_sched.c`.
+Требование NDMS (см. `NETFILTER_RACE.md`): накапливать вызовы `netfilter.d`,
+повторять при любой ошибке записи.
+Ключевое ограничение сверху — задержка первой записи: пока правил нет, а IP уже
+в ipset, новые соединения устанавливаются с маркой 0 и уходят мимо целевой
+политики навсегда (conntrack держит их до закрытия). Поэтому каждый SIGUSR1
+пишет таблицу без задержки.
 
-Состояние цикла — один флаг `g_commit_active`.
+Состояние — `commit_sched_t g_commit` (`failing`, `failures`, `step`, `event`).
 
-**`SIGUSR1`:**
+**`SIGUSR1`:** `commit_start()` → `commit_sched_on_signal()`: пауза повтора
+сбрасывается на первую, немедленный `perform_update()`. Успех → таймер на
+`NF_VERIFY_INTERVAL_MS` = 250 мс (подтверждающая запись: ndm может ещё
+переписывать таблицы); неуспех → таймер на 50 мс. Каждый сигнал перевзводит
+таймер, поэтому подтверждающая проходит после последнего хука пачки.
 
-- `g_commit_active != 0` → сигнал игнорируется целиком (`LOG_DEBUG "SIGUSR1
-  ignored, commit cycle active"`). Таймер **не** сбрасывается — это и есть
-  защита от дребезга: пачка из ~30 хуков одного события ndm не порождает ни
-  одной лишней записи и не сдвигает подтверждающую;
-- иначе → `commit_start()`: `g_commit_active=1`, немедленный `perform_update()`
-  (результат намеренно игнорируется — таблицу всё равно может затереть ndm
-  в середине своей пачки), таймер на `NF_COMMIT_INTERVAL_MS`.
-
-**`timer_fd`:** `signal_mgr_read_timer` → `commit_run()`:
+**`timer_fd`:** `signal_mgr_read_timer() > 0` → `commit_run()` →
+`commit_sched_on_timer()`:
 
 - `perform_update()` = `rci_auth_recover` + `rci_create_policies` (если
   `g_policies_pending`); при `g_drm_active` — `drm_get_states` +
@@ -719,14 +721,20 @@ ip -4|-6 route   replace blackhole default table <tableID>    # если DOWN
   (последний восстанавливает `ip rule`/`ip route` после NDMS: маршруты идемпотентны
   через `ip route replace`, `ip rule` — по «File exists»); всегда — `apply_unified_connmark_rules(..., &g_config,
   g_l7_active ? g_l7_wan : NULL)`
-- возврат `0` → `LOG_INFO "netfilter rules committed"`, `g_commit_active=0`,
-  цикл закончен; следующий SIGUSR1 запустит его заново
-- возврат `-1` → таймер снова на `NF_COMMIT_INTERVAL_MS`, без роста интервала.
-  Ретраи не заканчиваются: система самовосстанавливается без внешних событий
+- возврат `0` → `LOG_INFO "netfilter rules committed"` (после сбоя — `[WARN]`, см.
+  ниже), таймер не взводится; следующий SIGUSR1 запустит запись заново
+- возврат `-1` → таймер на следующую паузу: 50 → 100 → 250 → 500 → 1000 мс,
+  дальше каждые 3 с. Ретраи не заканчиваются: система самовосстанавливается без
+  внешних событий. Успех или новый SIGUSR1 начинает паузы снова с 50 мс
 
-Итого на одно событие ndm — минимум две записи: немедленная и подтверждающая
-через 3 с (она проходит уже после того, как пачка хуков отгремела). Вторая
-почти всегда бесплатна: дампы совпадают, `iptables-restore` не запускается.
+`[WARN]` пишется всегда, поэтому долгий сбой даёт две строки: `netfilter commit
+incomplete, retry in 50 ms, backing off to 3 s` в начале и `netfilter rules
+committed after N failed attempts` в конце; повторы между ними — `LOG_DEBUG`.
+
+Итого на одно событие ndm — `perform_update()` на каждый хук пачки и одна
+подтверждающая запись через 250 мс после последнего. Вызовы хуков пока не
+накапливаются (коалесцирования нет); повторные записи почти всегда дешёвы: дампы
+совпадают, `iptables-restore` не запускается.
 
 Стартовый коммит (шаг 24 инициализации) идёт через тот же `commit_start()` —
 отдельного пути установки правил нет.
@@ -1033,7 +1041,7 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 
 Полное дерево `/rci/show/ip/policy/` (JSON со всеми маршрутами всех политик, растёт с числом маршрутов без ограничений) не выкачивается и не парсится — ручной скобочный парсер и мегабайтные буферы удалены вместе с риском молчаливой поломки на обрезанном ответе.
 
-Без ретраев и без `sleep`; повтор — забота коммитера (`commit_run()` в `main.c`, фиксированные 3 с, без роста интервала).
+Без ретраев и без `sleep`; повтор — забота коммитера (`commit_run()` в `main.c`, паузы от 50 мс до 3 с, раздел 9).
 
 ### Создание политик
 
@@ -1063,8 +1071,8 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 
 `rci_get_policy_mark` вызывается на стартовой сверке (`startup_audit`) для каждой цели-политики, дальше — только для целей без правил в дампе (раздел 8A, п. 3), без ретраев и `sleep`.
 Если марку получить не удалось (политика только что создана и роутер ещё не назначил `markID`, RCI недоступен,
-авторизация отклонена) — `LOG_WARN`, цель пропускается в этом батче, функция
-возвращает `-1`. Коммитер повторит через фиксированные 3 с, бесконечно. Тем временем
+авторизация отклонена) — `LOG_WARN` (один раз на цель и причину), цель пропускается в этом батче, функция
+возвращает `-1`. Коммитер повторит через 50 мс, дальше с ростом паузы до 3 с, бесконечно. Тем временем
 `ipset` продолжает заполняться DNS/L7-каналами, а остальные цели уже промаркированы.
 
 > **Главное правило:** hrneo не молчит при проблемах с RCI, но и не валится — при недоступности роутера демон продолжает работать в degraded-режиме (`ipset` заполняется, конкретные политики временно без CONNMARK-правил).
@@ -1161,7 +1169,7 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 
 **Линковка:** `-Wl,--gc-sections -s`; static: `-static -static-libgcc`. Макрос `VERSION` передаётся через `-DVERSION`.
 
-26 исходных файлов (`src/*.c`), заголовочные в `include/`. `pthread` — из libc (musl и glibc ≥ 2.34), отдельного `-lpthread` нет. Никаких `LIBS`/`LDFLAGS` для L7 — `NFLOG` через стандартный kernel-заголовок `<linux/netfilter/nfnetlink.h>` (формат сообщений `NFULNL_*` задан локально в `nflog_capture.c`). Криптография QUIC (`quic_crypto.c`) — pure-C целочисленная арифметика, MIPS soft-float safe.
+27 исходных файлов (`src/*.c`), заголовочные в `include/`. `pthread` — из libc (musl и glibc ≥ 2.34), отдельного `-lpthread` нет. Никаких `LIBS`/`LDFLAGS` для L7 — `NFLOG` через стандартный kernel-заголовок `<linux/netfilter/nfnetlink.h>` (формат сообщений `NFULNL_*` задан локально в `nflog_capture.c`). Криптография QUIC (`quic_crypto.c`) — pure-C целочисленная арифметика, MIPS soft-float safe.
 
 ### Целевые платформы
 
@@ -1174,7 +1182,7 @@ GET /rci/show/ip/policy/NoSuch/mark      →  HTTP 404
 ## 17. Интеграция с Keenetic (сборка IPK)
 
 - **Init-скрипт:** `/opt/etc/init.d/S99hrneo` — стандартный Entware init (`rc.func`), `ENABLED=yes`, `PROCS=hrneo`, `PIDFILE=/var/run/hrneo.pid`
-- **Хуки ndm:** `/opt/etc/ndm/netfilter.d/015-hrneo.sh` (ndm переписал таблицы) и `/opt/etc/ndm/ifstatechanged.d/015-hrneo.sh` (сменилось состояние интерфейса) — одинаковые тонкие хуки: читают `/var/run/hrneo.pid`; если процесс живёт в `/proc` — `kill -USR1`. Фильтра по `$type`/`$table` намеренно нет: ndm не всегда передаёт в них то, что реально затёр; дребезг гасит коммитер в демоне
+- **Хуки ndm:** `/opt/etc/ndm/netfilter.d/015-hrneo.sh` (ndm переписал таблицы) и `/opt/etc/ndm/ifstatechanged.d/015-hrneo.sh` (сменилось состояние интерфейса) — одинаковые тонкие хуки: читают `/var/run/hrneo.pid`; если процесс живёт в `/proc` — `kill -USR1`. Фильтра по `$type`/`$table` намеренно нет: ndm не всегда передаёт в них то, что реально затёр; лишний сигнал дёшев — коммитер сверяет дамп и запускает `iptables-restore`, только если правил не хватает
 - **Symlink:** `/opt/bin/neo` → `/opt/etc/init.d/S99hrneo` (создаётся в `postinst`)
 - **postinst:** вставляет `[ $ACTION = start ] && sleep 10` в `rc.unslung` перед запуском, чтобы дать Keenetic поднять интерфейсы (извините, но это решает кучу проблем в т.ч. для другого софта...)
 - **UPX:** не применяется ни к одной архитектуре — снижение ложных срабатываний антивирусов (UPX поверх static-stripped ELF — главный триггер эвристик Mirai/Gafgyt).
@@ -1252,7 +1260,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 - Один NFLOG-сокет; диспетчер разводит по `dport`.
 - **NFLOG вместо NFQUEUE:** L7 только читает SNI/Host, пакет не модифицирует — назначение NFLOG, а не NFQUEUE. Нетерминирующая цель устраняет конкуренцию за трафик с zapret2/nfqws2. Нет verdict-сообщений → нагрузка ниже, чем у прежней NFQUEUE-схемы. Без fallback: нет модулей NFLOG → L7 выключается (`LOG_WARN`), демон работает на DNS-канале.
 - **Хуки FORWARD+OUTPUT, не POSTROUTING:** `FORWARD` покрывает forwarded LAN→WAN (после routing-decision доступен `-o WAN`), `OUTPUT` — соединения самого роутера. Ранний по ходу пакета хук даёт чистый ClientHello до десинхронизации соседнего NFQUEUE-демона.
-- Идемпотентность к DNS: `ipset_add_batch` с `NLM_F_EXCL` → двойное добавление IP no-op. Два источника (DNS + L7) безопасно пересекаются.
+- Идемпотентность к DNS: `ipset_add_batch` с `NLM_F_EXCL` → повторное добавление IP новым не считается (только продлевает timeout). Два источника (DNS + L7) безопасно пересекаются.
 - **Conntrack-реконнект L7 (`conntrack_delete_conn`):** L7 видит SNI/Host уже после установления TCP-соединения, выпущенного через WAN (до попадания dst-IP в ipset). Чтобы соединение пошло по политике, hrneo при **первом** добавлении IP (`process_hostname_event` вернул `> 0`, т.е. `NLM_F_EXCL`-новый) и при `ConntrackFlush=true` точечно удаляет conntrack-запись этого соединения по полному 5-tuple. Следующий пакет переоценивает `CONNMARK`-правила, смена src/NAT через политику вынуждает легитимный реконнект. Ранее здесь использовалась инъекция spoof-RST клиенту (`l7_rst.c`, удалён): RST как in-band-пакет обязан совпасть с `rcv_nxt` (RFC 5961, strict) и проигрывал гонку с ответом сервера — на практике соединение не рвалось и шло мимо политики. conntrack-DELETE действует на состоянии ядра, проверки seq-окна нет → надёжно. Удаляется только триггернувшее соединение (точно по 5-tuple, без коллатерали); полный conntrack-DUMP из L7 не вызывается — это прерогатива DNS-канала.
 - **GRO coalescing:** на роутере с GRO ядро склеивает TCP-сегменты до netfilter → NFLOG копирует CH целиком даже Kyber-размера → fast-path. Реассамблеция фазы 2 — страховочная сетка (GRO off / разные CPU / MSS-clamp / PMTU-дробление).
 
@@ -1276,7 +1284,7 @@ NFQUEUE-десинхронизаторов (zapret2/nfqws2/tpws) — они ра
 - **Суффиксный матчинг через хеш-таблицу.** Для каждой точки в домене проверяется parent-домен — `O(количество точек)`, каждая `O(1)` средний.
 - **Кэш ipset-списков и единый timeout.** `set_names[]` (cache `ipset list -n` при старте) + одно поле `default_timeout` менеджера (timeout одинаков для всех сетов) — в `ipset_add_batch` нет ни хеширования имени, ни риска коллизий.
 - **Общий open-addressed FNV-1a индекс.** `name_index_t` в `geodat` для `batches[]` и `usage[]` (`NAME_INDEX_SLOTS=256`, доступ к имени через `name_at_fn`) — заменяет `O(n)` линейный поиск при большом числе целей.
-- **Коалесцирование SIGUSR1.** Один `timerfd` на leading-edge цикл: первый сигнал пишет таблицу немедленно, пока цикл активен — сигналы игнорируются целиком, без сброса таймера. Пачка из ~30 хуков одного `interface X down` даёт ровно две записи вместо тридцати.
+- **Дешёвая запись на каждый SIGUSR1.** Один `timerfd`: каждый сигнал пишет таблицу немедленно, подтверждающая — через 250 мс после последнего сигнала, неудачная повторяется с ростом паузы от 50 мс до 3 с (`commit_sched.c`). Запись сверяет дамп только разбираемых цепочек и не запускает `iptables-restore`, если правила на месте.
 - **Асинхронный conntrack flush через netlink.** Два long-lived netlink-сокета (init однократно): неблокирующий `fd` для DUMP-потока (в epoll, чанки читаются между DNS-пакетами) + `del_fd` для DELETE fire-and-forget (без `NLM_F_ACK`). Новые IP коалесцируются в pending-буфер — один DUMP на burst вместо DUMP на каждый DNS-ответ, event loop не блокируется на сканировании таблицы. Без `fork`/`exec`.
 - **Стриминговый парсинг .dat-файлов.** Потоковое чтение через `setvbuf(64KB)`. В памяти хранятся только извлечённые записи. Visitor-pattern (`scan_dat_file`).
 - **Статическая аллокация в hot path.** `dns_result_t` (static в `process_dns_packet`), `processed[]`, `ipv4_batch[]`, `ipv6_batch[]`, `all_new[]` — на стеке, без `malloc`. CNAME-записи передаются в матчер как `dns_cname_t` напрямую из результата парсинга — промежуточного копирования на каждый DNS-ответ нет.
@@ -1340,4 +1348,4 @@ Event-driven архитектура на `epoll` (`cap.fd4` + `cap.fd6` + `signa
 
 **30 параметров конфига**, все доступны через CLI-флаги (`--flag value`) + `--config <path>`, `--version`/`-v`, `--help`/`-h`, `--genconfig [path]`, `--keenetic <token>`, `--match <имя>`, `--dump`; приоритет: CLI > конфиг > дефолты. Описание параметров — единая таблица `PARAMS[]` в `src/params.c`, драйвит `config_read`, args, `--help`, `--genconfig`.
 
-**Оптимизирован:** батчевый netlink (send N / recv N), хеш-таблица доменов 8192 бакетов с chunked pool (256КБ чанки), unified targets, batch `iptables-restore`, коалесцирование сигналов netfilter, conntrack flush через netlink с long-lived сокетом, статическая аллокация в hot path, двунаправленный CNAME BFS, BPF-фильтрация в ядре, `ipset CREATE` с автоматическим запросом kernel-revision, контроль `maxelem` с автомиграцией oversized `geoip:TAG` в disabled-секцию `CIDRfile`.
+**Оптимизирован:** батчевый netlink (send N / recv N), хеш-таблица доменов 8192 бакетов с chunked pool (256КБ чанки), unified targets, batch `iptables-restore` (на SIGUSR1 — только если по дампу не хватает правил), conntrack flush через netlink с long-lived сокетом, статическая аллокация в hot path, двунаправленный CNAME BFS, BPF-фильтрация в ядре, `ipset CREATE` с автоматическим запросом kernel-revision, контроль `maxelem` с автомиграцией oversized `geoip:TAG` в disabled-секцию `CIDRfile`.
