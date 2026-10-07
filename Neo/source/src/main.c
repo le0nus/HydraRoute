@@ -685,8 +685,8 @@ int main(int argc, char *argv[]) {
                     }
                 }
             } else if (events[i].data.fd == signals.timer_fd) {
-                signal_mgr_read_timer(&signals);
-                commit_run(&signals);
+                if (signal_mgr_read_timer(&signals) > 0)
+                    commit_run(&signals);
             }
         }
     }

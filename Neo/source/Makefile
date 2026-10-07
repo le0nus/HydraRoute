@@ -77,6 +77,8 @@ check:
 	@mkdir -p build
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_commit_sched.c src/commit_sched.c -o build/check_commit_sched
 	./build/check_commit_sched
+	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_signal_timer.c src/signal_handler.c src/log.c src/util.c -o build/check_signal_timer
+	./build/check_signal_timer
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_nf.c src/l7_firewall.c src/util.c src/log.c -o build/check_nf
 	./build/check_nf
 	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=run_command_output,--wrap=run_command_stdin,--wrap=log_write tests/check_connmark.c src/iptables.c src/l7_firewall.c src/util.c src/log.c -o build/check_connmark

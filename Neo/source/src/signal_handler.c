@@ -27,7 +27,9 @@ int signal_mgr_init(signal_mgr_t *m) {
         return -1;
     }
 
-    m->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+    /* Non-blocking: re-arming clears an expiration the loop has not read yet,
+     * and a blocking read would then wait for the whole new interval. */
+    m->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     if (m->timer_fd < 0) {
         LOG_ERROR("timerfd_create failed");
         close(m->sig_fd);
