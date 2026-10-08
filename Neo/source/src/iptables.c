@@ -52,7 +52,8 @@ typedef struct {
     size_t len;             /* batch length; counts on past the buffer, see batch_append */
     int  rule_count;
     int  warned_audit;
-    int  dump_ok;           /* dump holds the whole mangle dump of the last dump_chains() */
+    int  unsafe;            /* the last dump_chains() read PREROUTING whole, and it holds
+                             * an unconditional restore (unsafe_restore) */
     int  raw_kmod;          /* raw table module: 0 not tried, 1 loaded or no .ko, -1 load failed */
     int  raw_seen;          /* a raw dump has worked in this process */
     int  warned_raw_dump, warned_raw;
@@ -137,11 +138,28 @@ void iptables_delete_rules_matching(const char *ipt_cmd, const char *chain,
     }
 }
 
+/* An unconditional CONNMARK --restore-mark in mangle PREROUTING (hrneo before
+ * 1le2, the rule of a target no longer configured, a foreign rule) writes
+ * connmark 0 over the raw mark of every new connection (§3.2). */
+static int unsafe_restore(const char *dump) {
+    for (const char *line = dump; *line; ) {
+        const char *nl = strchr(line, '\n');
+        size_t len = nl ? (size_t)(nl - line) : strlen(line);
+        if (len > 14 && memcmp(line, "-A PREROUTING ", 14) == 0 &&
+            line_find(line, len, "-j CONNMARK --restore-mark") &&
+            !line_find(line, len, "-m connmark ! --mark 0x0 "))
+            return 1;
+        if (!nl) break;
+        line = nl + 1;
+    }
+    return 0;
+}
+
 static const char *const DUMP_CHAINS[] = {"PREROUTING", "FORWARD", "OUTPUT"};
 
 static int dump_chains(connmark_family_t *fam, int chain_count) {
     size_t off = 0;
-    fam->dump_ok = 0;
+    fam->unsafe = 0;
     for (int c = 0; c < chain_count; c++) {
         char *argv[] = {(char *)fam->ipt_cmd, "-w", "-t", "mangle", "-S",
                         (char *)DUMP_CHAINS[c], NULL};
@@ -151,9 +169,11 @@ static int dump_chains(connmark_family_t *fam, int chain_count) {
                      fam->ipt_cmd, DUMP_CHAINS[c]);
             return -1;
         }
+        /* Judged as soon as PREROUTING is read: a FORWARD or OUTPUT dump
+         * that fails or overflows next must not hide it (Ruling 29). */
+        if (c == 0) fam->unsafe = unsafe_restore(fam->dump);
         off += strlen(fam->dump + off);
     }
-    fam->dump_ok = 1;
     return 0;
 }
 
@@ -454,23 +474,6 @@ static int commit_mangle(connmark_family_t *fam, owned_index_t *own,
     return 0;
 }
 
-/* An unconditional CONNMARK --restore-mark in mangle PREROUTING (hrneo before
- * 1le2, the rule of a target no longer configured, a foreign rule) writes
- * connmark 0 over the raw mark of every new connection (§3.2). */
-static int unsafe_restore(const char *dump) {
-    for (const char *line = dump; *line; ) {
-        const char *nl = strchr(line, '\n');
-        size_t len = nl ? (size_t)(nl - line) : strlen(line);
-        if (len > 14 && memcmp(line, "-A PREROUTING ", 14) == 0 &&
-            line_find(line, len, "-j CONNMARK --restore-mark") &&
-            !line_find(line, len, "-m connmark ! --mark 0x0 "))
-            return 1;
-        if (!nl) break;
-        line = nl + 1;
-    }
-    return 0;
-}
-
 /* The raw table of a family as its last dump shows it, read in one pass with
  * no index: the chain, the jumps into it, and its rules compared in order
  * with the expected ones. */
@@ -552,7 +555,6 @@ static int raw_exact(const raw_view_t *v) {
 
 static int dump_raw(connmark_family_t *fam) {
     char *argv[] = {(char *)fam->ipt_cmd, "-w", "-t", "raw", "-S", NULL};
-    fam->dump_ok = 0;       /* the mangle dump is gone */
     if (run_command_output(fam->ipt_cmd, argv, fam->dump, sizeof(fam->dump)) != 0) {
         if (!fam->warned_raw_dump)
             LOG_WARN("%s -t raw -S failed or output truncated", fam->ipt_cmd);
@@ -634,6 +636,28 @@ static int unhook_raw(connmark_family_t *fam, const unified_target_t *targets, i
     return confirm_raw(fam, targets, count, fi, 0, v, r);
 }
 
+/* xt_conntrack does not load, so this call writes nothing to mangle and asks
+ * no RCI. The old rules stay, so the one safety step still runs, needing
+ * neither the module nor the marks (§4.5's exception): a jump next to an
+ * unconditional restore goes. Raw is read only where mangle has one.
+ * Returns 1 if some family had such a jump. */
+static int unhook_unsafe(const unified_target_t *targets, int count, family_result_t *res) {
+    int found = 0;
+    for (int fi = 0; fi < 2; fi++) {
+        connmark_family_t *fam = family(fi);
+        raw_view_t v;
+        if (dump_chains(fam, 1) != 0 || !fam->unsafe || dump_raw(fam) != 0)
+            continue;
+        scan_raw(fam, targets, count, fi, &v);
+        res[fi].raw_rules = v.rules;
+        if (v.jumps == 0) continue;
+        unhook_raw(fam, targets, count, fi, &v, &res[fi]);     /* the call fails anyway */
+        res[fi].reason = "old-restore";
+        found = 1;
+    }
+    return found;
+}
+
 /* Raw of one family after the mangle step of both. The chain goes in or
  * changes only when this call left mangle known-good: every policy mark
  * known (all_marks), and in both families R0..R3 confirmed and no
@@ -694,15 +718,14 @@ static int commit_raw(connmark_family_t *fam, const unified_target_t *targets, i
 }
 
 /* §3.2, §4.1: mangle first, then raw. The gate is checked once for both
- * families; the unsafe check reads each family's mangle dump before its raw
- * dump takes the buffer. */
+ * families. A family whose mangle step failed after reading PREROUTING still
+ * knows whether it holds an unconditional restore. */
 static int commit_raw_all(const unified_target_t *targets, int count, family_result_t *res) {
     int unsafe[2], all_marks = 1, gate = 1, ret = 0;
     for (int i = 0; i < count; i++)
         if (!targets[i].is_interface && !g_states[i].gone && !g_states[i].mark) all_marks = 0;
     for (int fi = 0; fi < 2; fi++) {
-        connmark_family_t *fam = family(fi);
-        unsafe[fi] = fam->dump_ok && unsafe_restore(fam->dump);
+        unsafe[fi] = family(fi)->unsafe;
         if (!res[fi].mangle_ok || unsafe[fi]) gate = 0;
     }
     for (int fi = 0; fi < 2; fi++)
@@ -743,7 +766,8 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
     /* R0, R1 and R3 match on the conntrack direction. */
     if (!conntrack_module) {
         if (l7_firewall_load_kmod_if_present("xt_conntrack") != 0) {
-            res[0].reason = res[1].reason = "conntrack-module";
+            if (!cfg->raw_guard || !unhook_unsafe(targets, count, res))
+                res[0].reason = res[1].reason = "conntrack-module";
             publish_status(cfg, res);
             return -1;
         }

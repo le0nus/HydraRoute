@@ -18,6 +18,19 @@ static const char *const OLD_RULES6[] = {
 #define OLD_FOREIGN  "-A PREROUTING -m set --match-set Old dst -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff"
 #define OLD_FOREIGN6 "-A PREROUTING -m set --match-set Old6 dst -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff"
 
+/* HydraRoute's raw rule as hrneo 1le2 wrote it, per family. */
+static const char *const HR_RAW[2] = {
+    "-A HRNEO_GUARD -m set --match-set HydraRoute dst -j MARK --set-xmark 0xff2/0xffffffff",
+    "-A HRNEO_GUARD -m set --match-set HydraRoute6 dst -j MARK --set-xmark 0xff2/0xffffffff",
+};
+
+/* A chain with HydraRoute's rule and one jump into it, as 1le2 leaves it. */
+static void raw_leftover(int fi) {
+    nf[fi].guard_exists = 1;
+    lines_add(nf[fi].guard, &nf[fi].guard_len, HR_RAW[fi]);
+    lines_add(nf[fi].raw_pre, &nf[fi].raw_pre_len, GUARD_JUMP);
+}
+
 /* RU, HydraRoute and the DirectRoute interface target wg0. */
 static void targets_with_wg0(unified_target_t *t3, const unified_target_t *t) {
     memcpy(t3, t, 2 * sizeof(*t));
@@ -35,24 +48,40 @@ static void check_start_and_migration(const unified_target_t *t, config_t *cfg) 
     for (int i = 0; i < 4; i++) lines_add(nf[0].mangle, &nf[0].mangle_len, OLD_RULES[i]);
     for (int i = 0; i < 2; i++) lines_add(nf[1].mangle, &nf[1].mangle_len, OLD_RULES6[i]);
     /* hrneo 1le2 ran before and was rolled back to 1le1 without raw-off: the
-     * IPv6 chain and its jump are still there, next to the old rules. */
-    nf[1].guard_exists = 1;
-    lines_add(nf[1].guard, &nf[1].guard_len,
-              "-A HRNEO_GUARD -m set --match-set HydraRoute6 dst -j MARK --set-xmark 0xff2/0xffffffff");
-    lines_add(nf[1].raw_pre, &nf[1].raw_pre_len, GUARD_JUMP);
+     * chains and their jumps are still there, next to the old rules. */
+    raw_leftover(0);
+    raw_leftover(1);
 
-    /* xt_conntrack does not load: nothing is touched, the next commit tries
-     * again. The status file still says why the raw guard is not on. */
+    /* xt_conntrack does not load: no RCI and no mangle write, the next commit
+     * tries again. Old R1 and R2 stay, so the jumps next to them go in both
+     * families: the safety step needs neither the module nor the marks
+     * (Ruling 29). */
     reset();
     kmod_result = -1;
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
-    assert(kmod_calls == 1 && dumps == 0 && rci_calls == 0);
+    assert(kmod_calls == 1 && rci_calls == 0);
     assert(restores[0][0] == 0 && restores[1][0] == 0);
+    assert(strcmp(calls, "r4 r6 ") == 0);
     assert(raw_kmod_calls[0] == 0 && raw_kmod_calls[1] == 0);
+    assert(raw_jumps(0) == 0 && nf[0].guard_len == 0);
+    assert(raw_jumps(1) == 0 && nf[1].guard_len == 0);
+    assert(warns == 3);                     /* two jump removals, the raw guard */
+    assert(strstr(warn_log, "iptables: removed the jump to raw HRNEO_GUARD"));
+    assert(strstr(warn_log, "ip6tables: removed the jump to raw HRNEO_GUARD"));
+    assert(status_has("raw_guard=degraded:old-restore-v4"));
+    assert(status_has("raw_rules_v4=0") && status_has("raw_rules_v6=0"));
+
+    /* Still not loaded: nothing left to take down; the status names the module. */
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    assert(kmod_calls == 1 && rci_calls == 0 && calls[0] == '\0');
     assert(warns == 1 && strstr(warn_log, "raw guard degraded: conntrack-module-v4"));
     assert(status_has("raw_guard=degraded:conntrack-module-v4"));
-    assert(status_has("raw_rules_v4=unknown") && status_has("raw_rules_v6=unknown"));
     kmod_result = 0;
+
+    /* An IPv6 chain and jump are back while RCI is still down (a 1le2 binary
+     * run by hand): the same step in the normal path follows. */
+    raw_leftover(1);
 
     /* RCI down at start: no mark is known; the old rules are kept as written,
      * only put in PolicyOrder (RU first). The raw chain stays out while they
@@ -73,7 +102,7 @@ static void check_start_and_migration(const unified_target_t *t, config_t *cfg) 
     assert(strcmp(nf[0].mangle[1], OLD_RULES[2]) == 0 && strcmp(nf[0].mangle[2], OLD_RULES[3]) == 0);
     assert(strcmp(nf[0].mangle[3], OLD_RULES[0]) == 0 && strcmp(nf[0].mangle[4], OLD_RULES[1]) == 0);
     assert(nf[1].mangle_len == 2);
-    assert(!nf[0].guard_exists);
+    assert(raw_jumps(0) == 0 && nf[0].guard_len == 0);
     assert(raw_jumps(1) == 0 && nf[1].guard_len == 0);
     assert(status_has("raw_guard=degraded:no-mark-v4"));
     assert(status_has("raw_rules_v4=0") && status_has("raw_rules_v6=0"));
@@ -489,6 +518,32 @@ static void check_raw(const unified_target_t *t, config_t *cfg) {
     assert(strcmp(calls, "m4 ") == 0);
     assert_mangle(0, 1, 0xff2, 0);
     assert_raw(0, 0xff2);
+    assert(status_has("raw_guard=on"));
+
+    /* L7 on: PREROUTING reads back with an old restore, then the FORWARD dump
+     * fails (cut short by a large foreign chain, say). Mangle is not replaced
+     * and raw cannot go in, but the jumps next to the old restore still go,
+     * in both families (Ruling 29). */
+    reset();
+    lines_add(nf[0].mangle, &nf[0].mangle_len, OLD_RULES[1]);
+    lines_add(nf[1].mangle, &nf[1].mangle_len, OLD_RULES6[1]);
+    dump_fail_chain[0] = dump_fail_chain[1] = "FORWARD";
+    assert(apply_unified_connmark_rules(t, 2, cfg, "eth3") == -1);
+    dump_fail_chain[0] = dump_fail_chain[1] = NULL;
+    assert(strcmp(calls, "r4 r6 ") == 0);
+    assert(raw_jumps(0) == 0 && nf[0].guard_len == 0);
+    assert(raw_jumps(1) == 0 && nf[1].guard_len == 0);
+    assert(strstr(warn_log, "iptables -t mangle -S FORWARD failed or output truncated"));
+    assert(strstr(warn_log, "ip6tables -t mangle -S FORWARD failed or output truncated"));
+    assert(status_has("raw_guard=degraded:old-restore-v4"));
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, "eth3") == 0);
+    assert(strcmp(calls, "m4 m6 r4 r6 ") == 0);
+    assert_mangle(0, 1, 0xff2, 0);
+    assert_mangle(1, 0, 0xff2, 0);
+    assert_raw(0, 0xff2);
+    assert_raw(1, 0xff2);
+    for (int fi = 0; fi < 2; fi++) assert(nf[fi].fwd_len == 2 && nf[fi].out_len == 2);
     assert(status_has("raw_guard=on"));
 
     /* An unconditional restore hrneo does not own: mangle cannot fix it, so

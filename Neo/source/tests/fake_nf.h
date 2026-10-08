@@ -49,6 +49,7 @@ static const char *restore_error;
 static int  restore_error_family = -1; /* family restore_error applies to, -1: both */
 static int  restore_error_table = -1;  /* table restore_error applies to: 0 mangle, 1 raw, -1 both */
 static int  dump_fail[2];              /* iptables -t mangle -S fails or is truncated */
+static const char *dump_fail_chain[2]; /* ... only for this mangle chain */
 static int  raw_dump_fail[2];          /* iptables -t raw -S fails (no table) or is truncated */
 static int  raw_echo_other;            /* fake an iptables that prints the MARK target otherwise */
 static int  kmod_result;               /* xt_conntrack */
@@ -111,7 +112,9 @@ int __wrap_run_command_output(const char *cmd, char *const argv[], char *output,
     size_t off = 0;
     dumps++;
     output[0] = '\0';
-    if (raw ? raw_dump_fail[fi] : dump_fail[fi]) return -1;
+    if (raw ? raw_dump_fail[fi]
+            : dump_fail[fi] || (dump_fail_chain[fi] && strcmp(argv[5], dump_fail_chain[fi]) == 0))
+        return -1;
 #define OUT(...) (off += (size_t)snprintf(output + off, size - off, __VA_ARGS__))
     if (raw) {
         OUT("-P PREROUTING ACCEPT\n-P OUTPUT ACCEPT\n");
