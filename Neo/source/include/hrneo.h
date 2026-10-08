@@ -7,6 +7,7 @@
 
 #define DEFAULT_CONFIG_PATH       "/opt/etc/HydraRoute/hrneo.conf"
 #define DEFAULT_PID_FILE          "/var/run/hrneo.pid"
+#define DEFAULT_LOCK_FILE         "/var/run/hrneo.lock"
 #define WATCHLIST_SOCKET          "/var/run/hrneo.sock"
 #define DEFAULT_API_PORT          79
 #define IPSET_HASH_TYPE           "hash:net"
@@ -88,6 +89,7 @@ typedef struct {
     int global_routing;
     int conntrack_flush;
     int raw_guard;
+    int keep_ipset_on_restart;
     int ipset_maxelem;
     char geo_ip_files[MAX_GEO_FILES][MAX_PATH_LEN];
     int geo_ip_file_count;

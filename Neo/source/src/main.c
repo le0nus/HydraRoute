@@ -6,6 +6,7 @@
 #include "../include/watchlist.h"
 #include "../include/watchlist_api.h"
 #include "../include/ipset_nl.h"
+#include "../include/ipset_start.h"
 #include "../include/dns.h"
 #include "../include/packet_capture.h"
 #include "../include/iptables.h"
@@ -88,20 +89,6 @@ static void remove_pid_file(const char *path) {
     if (unlink(path) != 0 && errno != ENOENT) {
         LOG_WARN("PID file remove error: %s", strerror(errno));
     }
-}
-
-static int initialize_ipsets(ipset_manager_t *mgr, const ipset_pair_t *pairs, int count,
-                             int clear, uint32_t timeout, uint32_t maxelem) {
-    for (int i = 0; i < count; i++) {
-        ipset_create(mgr, pairs[i].ipv4, IPSET_HASH_TYPE, AF_INET, timeout, maxelem);
-        ipset_create(mgr, pairs[i].ipv6, IPSET_HASH_TYPE, AF_INET6, timeout, maxelem);
-
-        if (clear) {
-            ipset_flush(mgr, pairs[i].ipv4);
-            ipset_flush(mgr, pairs[i].ipv6);
-        }
-    }
-    return 0;
 }
 
 static void format_ipv4(const uint8_t *ip, char *buf, int buf_size) {
@@ -342,6 +329,10 @@ int main(int argc, char *argv[]) {
         }
     }
     if (ar == 5) return wlapi_request(WATCHLIST_SOCKET, args.api_command, args.api_arg);
+    if (ar == 6) {
+        guard_status_init(GUARD_STATUS_PATH);
+        return raw_off_command(DEFAULT_LOCK_FILE);
+    }
     if (ar > 0) return 0;
     if (ar < 0) return 1;
 
@@ -364,10 +355,32 @@ int main(int argc, char *argv[]) {
     args_apply(&args, &g_config);
     rci_set_token(g_config.rci_token);
 
-    if (!g_config.auto_start) return 0;
+    /* RawGuard=false (§5) takes the raw chain down on every start, before
+     * autoStart=false or a failed start can end it early. */
+    if (!g_config.auto_start && g_config.raw_guard) return 0;
 
     log_setup(&g_config);
-    LOG_INFO("HRNeo v%s starting", VERSION);
+    if (g_config.auto_start) LOG_INFO("HRNeo v%s starting", VERSION);
+
+    /* Held, never closed, until the process exits: hrneo --raw-off and a
+     * second hrneo refuse while it is held, so nothing touches raw between
+     * this process's commits (neo raw-off waits for it to go). */
+    int lock_fd = lock_acquire(DEFAULT_LOCK_FILE);
+    if (lock_fd < 0) {
+        if (lock_fd == LOCK_HELD)
+            LOG_ERROR("Already running: %s is held by another hrneo", DEFAULT_LOCK_FILE);
+        else
+            LOG_ERROR("Cannot lock %s: %s", DEFAULT_LOCK_FILE, strerror(errno));
+        log_close();
+        return 1;
+    }
+
+    guard_status_init(GUARD_STATUS_PATH);
+    if (!g_config.raw_guard) raw_guard_disable();
+    if (!g_config.auto_start) {
+        log_close();
+        return 0;
+    }
 
     rci_token_bootstrap(cfg_path);
 
@@ -518,15 +531,7 @@ int main(int argc, char *argv[]) {
         ipset_pair_t init_pairs[MAX_TARGETS];
         for (int i = 0; i < g_all_sorted_count; i++)
             init_pairs[i] = g_all_sorted[i].pair;
-        initialize_ipsets(&g_ipset_mgr, init_pairs, g_all_sorted_count,
-                          g_config.clear_ipset, g_ipset_mgr.default_timeout,
-                          (uint32_t)g_config.ipset_maxelem);
-    }
-
-    if (g_config.cidr_enabled && g_config.cidr_file_path[0] != '\0') {
-        add_cidr_to_ipsets(&g_ipset_mgr, g_config.cidr_file_path,
-                           (const char (*)[512])g_config.geo_ip_files, g_config.geo_ip_file_count,
-                           (uint32_t)g_config.ipset_maxelem);
+        ipset_start_targets(&g_ipset_mgr, init_pairs, g_all_sorted_count, &g_config);
     }
 
     if (gs_count > 0) {
@@ -650,7 +655,6 @@ int main(int argc, char *argv[]) {
 
     LOG_INFO("Packet capture started, waiting for DNS responses...");
 
-    guard_status_init(GUARD_STATUS_PATH);
     commit_start(&signals);
 
     struct epoll_event events[8];

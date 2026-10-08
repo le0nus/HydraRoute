@@ -31,7 +31,7 @@ LDFLAGS_DYNAMIC = $(COMMON_LDFLAGS)
 
 LIBS =
 
-SRCS = src/main.c src/util.c src/log.c src/config.c src/args.c src/params.c src/watchlist.c src/ipset_nl.c src/dns.c src/packet_capture.c src/iptables.c src/guard.c src/guard_status.c src/rtnl.c src/signal_handler.c src/commit_sched.c src/rci.c src/conntrack.c src/geodat.c src/routing.c src/probe_tls.c src/probe_http.c src/probe_quic.c src/quic_crypto.c src/bogon.c src/nflog_capture.c src/l7_dispatch.c src/l7_firewall.c src/tcp_reasm.c src/watchlist_api.c
+SRCS = src/main.c src/util.c src/log.c src/config.c src/args.c src/params.c src/watchlist.c src/ipset_nl.c src/ipset_start.c src/dns.c src/packet_capture.c src/iptables.c src/guard.c src/guard_status.c src/rtnl.c src/signal_handler.c src/commit_sched.c src/rci.c src/conntrack.c src/geodat.c src/routing.c src/probe_tls.c src/probe_http.c src/probe_quic.c src/quic_crypto.c src/bogon.c src/nflog_capture.c src/l7_dispatch.c src/l7_firewall.c src/tcp_reasm.c src/watchlist_api.c
 
 .PHONY: all clean mipsel mips aarch64 native check
 
@@ -99,6 +99,8 @@ check:
 	./build/check_rci
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_config.c src/config.c src/params.c src/args.c src/util.c src/log.c -o build/check_config
 	./build/check_config
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=ipset_create,--wrap=ipset_flush,--wrap=add_cidr_to_ipsets,--wrap=log_write tests/check_ipset_start.c src/ipset_start.c src/config.c src/params.c src/args.c src/util.c src/log.c -o build/check_ipset_start
+	./build/check_ipset_start
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_watchlist.c src/watchlist.c src/util.c src/log.c -o build/check_watchlist
 	./build/check_watchlist
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_wlapi.c src/watchlist_api.c src/watchlist.c src/util.c src/log.c -o build/check_wlapi
@@ -111,6 +113,7 @@ check:
 	./build/check_packet_capture
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_run_command.c src/util.c -o build/check_run_command
 	./build/check_run_command
+	sh tests/check_lifecycle.sh
 
 clean:
 	rm -rf build/

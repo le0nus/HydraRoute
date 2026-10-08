@@ -55,6 +55,13 @@ int config_read(const char *path, config_t *cfg) {
     return 0;
 }
 
+/* §4.3: with KeepIpsetOnRestart a restart keeps the sets, so the raw guard
+ * keeps matching through it; clearIPSet only counts when that is off
+ * (neo ipset-clean turns it off for one start). */
+int config_flush_ipsets_on_start(const config_t *cfg) {
+    return cfg->clear_ipset && !cfg->keep_ipset_on_restart;
+}
+
 #define GENCONFIG_FILENAME "hrneo.conf"
 
 static int resolve_genconfig_path(const char *target, char *out, size_t out_size) {

@@ -8,4 +8,49 @@ DESC="HydraRoute Neo daemon"
 PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 PIDFILE=/var/run/hrneo.pid
 
+# hrneo holds a flock on /var/run/hrneo.lock from start to exit, its cleanup
+# included; /proc/locks names the inode of a held one.
+lock_held() {
+    set -- $(ls -i /var/run/hrneo.lock 2>/dev/null)
+    [ -n "${1:-}" ] && grep -q "FLOCK.*:$1 " /proc/locks 2>/dev/null
+}
+
+# Stops hrneo and waits up to 10 s until no hrneo process is left and the
+# lock is free. rc.func's own result does not count: it may start or stop
+# nothing and still report either way.
+stop_and_wait() {
+    ( set -- stop "$1"; . /opt/etc/init.d/rc.func )
+    n=0
+    while pidof hrneo > /dev/null || lock_held; do
+        if [ "$n" -ge 10 ]; then
+            echo "hrneo did not stop within 10 s; nothing changed" >&2
+            return 1
+        fi
+        sleep 1
+        n=$((n + 1))
+    done
+    return 0
+}
+
+case "$1" in
+    raw-off)
+        # Takes the raw guard down, e.g. before installing a version without
+        # it. hrneo is stopped first, so nothing puts the chain back; hrneo
+        # --raw-off itself refuses (exit 2) while any hrneo holds the lock.
+        stop_and_wait "$2" || exit 1
+        hrneo --raw-off || exit $?
+        echo "hrneo stays stopped. Its next start with RawGuard=true puts the raw guard back;"
+        echo "RawGuard=false in /opt/etc/HydraRoute/hrneo.conf keeps it off."
+        exit 0
+        ;;
+    ipset-clean)
+        # Starts hrneo again with its sets emptied; the raw chain stays. The
+        # CIDR list puts its addresses back at start and DNS answers the
+        # others, which are not marked early until they are back.
+        stop_and_wait "$2" || exit 1
+        ARGS="--KeepIpsetOnRestart false --clearIPSet true"
+        set -- start "$2"
+        ;;
+esac
+
 . /opt/etc/init.d/rc.func

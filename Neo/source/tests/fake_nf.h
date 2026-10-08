@@ -54,6 +54,7 @@ static const char *mark_ru = "ff1", *mark_hr = "ff2";
 static const char *restore_error;
 static int  restore_error_family = -1; /* family restore_error applies to, -1: both */
 static int  restore_error_table = -1;  /* table restore_error applies to: 0 mangle, 1 raw, -1 both */
+static int  raw_restore_noop[2];       /* a raw restore says it worked and changes nothing */
 static int  dump_fail[2];              /* iptables -t mangle -S fails or is truncated */
 static const char *dump_fail_chain[2]; /* ... only for this mangle chain */
 static int  dump_fail_at[2];           /* ... only the n-th mangle read since reset() */
@@ -223,6 +224,7 @@ int __wrap_run_command_stdin(const char *cmd, char *const argv[], const char *in
     snprintf(calls + strlen(calls), sizeof(calls) - strlen(calls), "%c%d ", table ? 'r' : 'm', fi ? 6 : 4);
     snprintf(err, err_size, "%s", fail ? restore_error : "");
     if (fail) return 1;
+    if (table && raw_restore_noop[fi]) return 0;
 
     assert(len < sizeof(buf));
     memcpy(buf, input, len);

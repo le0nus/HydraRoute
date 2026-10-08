@@ -1,0 +1,32 @@
+#!/bin/sh
+# opkg runs prerm with "remove" when the package goes and with
+# "upgrade <version>" when another version replaces it. Only a removal takes
+# the raw guard down: before installing a version without it, run
+# 'neo raw-off' by hand and check that raw holds no HRNEO_GUARD.
+[ "$1" = "remove" ] || exit 0
+export PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# hrneo leaves its raw chain in place on stop, so restarts stay protected;
+# without hrneo nothing maintains it, so it goes with the package. raw-off
+# stops hrneo, waits for it to exit and removes the chain. If any of that
+# fails the package stays, and removing it again tries again.
+if ! /opt/etc/init.d/S99hrneo raw-off; then
+    echo "hrneo: raw guard not removed, package kept; fix the cause and remove it again" >&2
+    exit 1
+fi
+
+# The raw modules go too, but only with a table shown empty: read whole,
+# with no rule, no chain of its own and the built-in policies ACCEPT. A
+# table that cannot be read keeps its module.
+for pair in iptable_raw:iptables ip6table_raw:ip6tables; do
+    mod=${pair%%:*}
+    ipt=${pair#*:}
+    lsmod 2>/dev/null | grep -q "^$mod " || continue
+    if ! dump=$($ipt -w -t raw -S 2>/dev/null); then
+        echo "hrneo: $ipt -t raw -S failed, $mod stays loaded" >&2
+        continue
+    fi
+    printf '%s\n' "$dump" | grep -qvx -e '-P PREROUTING ACCEPT' -e '-P OUTPUT ACCEPT' && continue
+    rmmod "$mod" || echo "hrneo: rmmod $mod failed, it stays loaded" >&2
+done
+exit 0

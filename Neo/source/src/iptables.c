@@ -5,6 +5,7 @@
 #include "../include/log.h"
 #include "../include/rtnl.h"
 #include "../include/util.h"
+#include <errno.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,6 +13,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
 
 /* main.c builds the target list once, so target i keeps its index, and its
  * state here, for the life of the process. */
@@ -74,6 +76,12 @@ typedef struct {
 
 static target_state_t g_states[MAX_TARGETS];
 static connmark_family_t g_fams[2];         /* no initializer: stays in .bss */
+
+/* RawGuard=false (§5): set once the chain and its jumps are known gone from
+ * both families; until then every commit tries again. A commit with
+ * RawGuard=true clears it, since that one may put the chain back. */
+static int g_raw_off_done;
+static int g_raw_off_failed_fi;             /* the family the last failed removal names */
 
 static connmark_family_t *family(int fi) {
     connmark_family_t *fam = &g_fams[fi];
@@ -594,6 +602,12 @@ static int raw_exact(const raw_view_t *v) {
     return v->chain && v->jumps == 1 && v->jump_first && v->rules_exact;
 }
 
+/* /proc/net/ip{,6}_tables_names: 1 the kernel has the family's raw table,
+ * 0 it has not (so it holds no rules), -1 unknown. */
+static int raw_table_listed(int fi) {
+    return proc_list_has(fi ? "/proc/net/ip6_tables_names" : "/proc/net/ip_tables_names", "raw");
+}
+
 static int dump_raw(connmark_family_t *fam) {
     char *argv[] = {(char *)fam->ipt_cmd, "-w", "-t", "raw", "-S", NULL};
     if (run_command_output(fam->ipt_cmd, argv, fam->dump, sizeof(fam->dump)) != 0) {
@@ -724,8 +738,7 @@ static int commit_raw(connmark_family_t *fam, const unified_target_t *targets, i
          * so a table the kernel does not list is not there: a stable state
          * with no retries of its own. Listed, or the list unreadable: the
          * read failed, and the call is retried. */
-        if (proc_list_has(fi ? "/proc/net/ip6_tables_names" : "/proc/net/ip_tables_names",
-                          "raw") == 0) {
+        if (raw_table_listed(fi) == 0) {
             r->reason = "raw-modules";
             return 0;
         }
@@ -783,11 +796,117 @@ static int commit_raw_all(const unified_target_t *targets, int count, family_res
     return ret;
 }
 
+/* neo raw-off, RawGuard=false and package removal (§5): the jumps and the
+ * chain of one family leave in one restore, and a read-back must show them
+ * gone. A raw table the kernel does not list holds no rules and is not read,
+ * so no module gets loaded for it; listed, or the list unreadable, the dump
+ * decides. Returns 1 removed, 0 nothing there, -1 not known to be gone. */
+static int raw_remove_family(int fi) {
+    connmark_family_t *fam = family(fi);
+    raw_view_t v;
+    if (raw_table_listed(fi) == 0) return 0;
+    if (dump_raw(fam) != 0) return -1;
+    scan_raw(fam, NULL, 0, fi, &v);
+    if (!v.chain && !v.jumps && !v.rules) return 0;
+    fam->len = 0;
+    fam->rule_count = 1;
+    batch_append(fam, "*raw\n");
+    for (int j = 0; j < v.jumps; j++) batch_append(fam, "-D PREROUTING -j %s\n", GUARD_CHAIN);
+    if (v.chain) batch_append(fam, "-F %s\n-X %s\n", GUARD_CHAIN, GUARD_CHAIN);
+    if (commit_batch(fam) != 0 || dump_raw(fam) != 0) return -1;
+    scan_raw(fam, NULL, 0, fi, &v);
+    if (v.chain || v.jumps || v.rules) {
+        LOG_WARN("%s: raw %s still there after removal: chain %d, jumps %d, rules %d",
+                 fam->ipt_cmd, GUARD_CHAIN, v.chain, v.jumps, v.rules);
+        return -1;
+    }
+    LOG_INFO("%s: raw %s removed", fam->ipt_cmd, GUARD_CHAIN);
+    return 1;
+}
+
+/* Both families; a failure in one does not stop the other. Returns 0 when
+ * gone from both (*removed: a restore took something out), else -1 with
+ * *failed_fi the first family that failed. */
+static int raw_remove_all(int *removed, int *failed_fi) {
+    int ret = 0;
+    *removed = 0;
+    for (int fi = 0; fi < 2; fi++) {
+        int r = raw_remove_family(fi);
+        if (r > 0) *removed = 1;
+        if (r < 0 && ret == 0) {
+            ret = -1;
+            *failed_fi = fi;
+        }
+    }
+    return ret;
+}
+
+int raw_guard_remove(void) {
+    int removed, failed_fi;
+    return raw_remove_all(&removed, &failed_fi);
+}
+
+static int raw_off_try(int *removed) {
+    int r = raw_remove_all(removed, &g_raw_off_failed_fi);
+    g_raw_off_done = r == 0;
+    return r;
+}
+
+/* RawGuard=false: off only once the chain and its jumps are known gone from
+ * both families; until then degraded, naming the family that failed. */
+static void raw_off_status(void) {
+    char reason[GUARD_REASON_MAX];
+    if (g_raw_off_done) {
+        guard_status_set_raw(RAW_GUARD_OFF, "", -1, -1);
+        return;
+    }
+    snprintf(reason, sizeof(reason), "raw-off-failed-v%d", g_raw_off_failed_fi ? 6 : 4);
+    guard_status_set_raw(RAW_GUARD_DEGRADED, reason, -1, -1);
+}
+
+/* One removal with its result in the status file. */
+static int raw_off_publish(int *removed) {
+    int r = raw_off_try(removed);
+    raw_off_status();
+    if (*removed) guard_status_set_rebuild(time(NULL));
+    guard_status_flush();
+    return r;
+}
+
+int raw_guard_disable(void) {
+    int removed;
+    return raw_off_publish(&removed);
+}
+
+int raw_off_command(const char *lock_path) {
+    int fd = lock_acquire(lock_path);
+    if (fd == LOCK_HELD) {
+        LOG_ERROR("hrneo is running; stop it first (neo stop)");
+        return 2;
+    }
+    if (fd < 0) {
+        LOG_ERROR("Cannot lock %s: %s", lock_path, strerror(errno));
+        return 1;
+    }
+    /* The status written under the lock: a daemon starting next writes its
+     * own only after it has the lock. */
+    int removed;
+    int r = raw_off_publish(&removed);
+    close(fd);
+    if (r != 0) {
+        LOG_ERROR("raw guard chain %s not fully removed", GUARD_CHAIN);
+        return 1;
+    }
+    printf("hrneo: %s; the next start with RawGuard=true puts it back\n",
+           removed ? "raw guard chain " GUARD_CHAIN " removed" : "no raw guard chain " GUARD_CHAIN " to remove");
+    return 0;
+}
+
 /* raw_guard=<state>[:<reason>-v4|v6] in the status file; the first family
  * with a reason names it. */
 static void publish_status(const config_t *cfg, const family_result_t *res) {
     if (!cfg->raw_guard) {
-        guard_status_set_raw(RAW_GUARD_OFF, "", -1, -1);
+        raw_off_status();
     } else if (!res[0].reason && !res[1].reason) {
         guard_status_set_raw(RAW_GUARD_ON, "", res[0].raw_rules, res[1].raw_rules);
     } else {
@@ -813,6 +932,13 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
     memset(recheck, 0, sizeof(recheck));
     memset(res, 0, sizeof(res));
     res[0].raw_rules = res[1].raw_rules = -1;
+
+    /* RawGuard=false: main() took the chain down at start; until that has
+     * worked every commit tries again, needing neither xt_conntrack nor RCI. */
+    if (cfg->raw_guard)
+        g_raw_off_done = 0;
+    else if (!g_raw_off_done && raw_off_try(&res[0].replaced) != 0)
+        incomplete = 1;
 
     /* R0, R1 and R3 match on the conntrack direction. */
     if (!conntrack_module) {

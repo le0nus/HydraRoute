@@ -689,22 +689,29 @@ static void check_raw(const unified_target_t *t, config_t *cfg) {
     assert_raw(1, 0xff2);
     assert(strstr(warn_log, "raw guard on again (was degraded: restore-v6)"));
 
-    /* RawGuard=false: raw is not read or written and the status says off. In
-     * this version the chain in place is left alone (raw-off is Task 4). */
+    /* RawGuard=false (§5): the chain in place goes, in the one family that
+     * has it (IPv4 was taken down by hand), and the status says off. Once it
+     * is gone raw is not read again. */
     reset();
     cfg->raw_guard = 0;
     raw_clear(0);
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
-    assert(calls[0] == '\0' && dumps == 2);
-    assert(!nf[0].guard_exists);
-    assert_raw(1, 0xff2);
+    assert(strcmp(calls, "r6 ") == 0);
+    assert(proc_calls == 2 && dumps == 5);  /* mangle per family, raw v4, raw v6 and its read-back */
+    assert(!nf[0].guard_exists && !nf[1].guard_exists && raw_jumps(1) == 0);
+    assert(nf[1].raw_pre_len == 1 && strcmp(nf[1].raw_pre[0], FOREIGN_RAW) == 0);
+    assert(warns == 0);
     assert(status_has("raw_guard=off"));
     assert(status_has("raw_rules_v4=unknown") && status_has("raw_rules_v6=unknown"));
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(calls[0] == '\0' && dumps == 2 && proc_calls == 0);
     cfg->raw_guard = 1;
     reset();
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
-    assert(strcmp(calls, "r4 ") == 0);
+    assert(strcmp(calls, "r4 r6 ") == 0);
     assert_raw(0, 0xff2);
+    assert_raw(1, 0xff2);
     assert(status_has("raw_guard=on"));
 }
 
@@ -1077,6 +1084,95 @@ static void check_mark_change_failures(const unified_target_t *t, config_t *cfg)
     assert(status_has("raw_guard=on"));
 }
 
+static fake_nf_t saved_nf[2];
+static char saved_foreign[2][MAX_LINES * LINE_LEN];
+
+/* mangle as saved, every chain hrneo writes to: PREROUTING, and FORWARD and
+ * OUTPUT with the L7 rules. */
+static void assert_mangle_unchanged(void) {
+    for (int fi = 0; fi < 2; fi++) {
+        const fake_nf_t *a = &nf[fi], *b = &saved_nf[fi];
+        assert(a->mangle_len == b->mangle_len && a->fwd_len == b->fwd_len && a->out_len == b->out_len);
+        assert(memcmp(a->mangle, b->mangle, (size_t)a->mangle_len * LINE_LEN) == 0);
+        assert(memcmp(a->fwd, b->fwd, (size_t)a->fwd_len * LINE_LEN) == 0);
+        assert(memcmp(a->out, b->out, (size_t)a->out_len * LINE_LEN) == 0);
+    }
+}
+
+/* neo raw-off (hrneo --raw-off, prerm) after the daemon has run: the jumps
+ * and the chain leave in one raw restore per family, read back to be sure.
+ * The foreign raw rules of both families and all of mangle stay. */
+static void check_raw_off(const unified_target_t *t, config_t *cfg) {
+    for (int fi = 0; fi < 2; fi++) {
+        if (lines_find(nf[fi].raw_pre, nf[fi].raw_pre_len, FOREIGN_RAW2) < 0)
+            lines_add(nf[fi].raw_pre, &nf[fi].raw_pre_len, FOREIGN_RAW2);
+        raw_foreign(&nf[fi], saved_foreign[fi], sizeof(saved_foreign[fi]));
+        assert(nf[fi].fwd_len == 2 && nf[fi].out_len == 2);     /* the L7 rules are there */
+    }
+    assert_raw(0, 0xff2);
+    assert_raw(1, 0xff2);
+    memcpy(saved_nf, nf, sizeof(nf));
+
+    reset();
+    assert(raw_guard_remove() == 0);
+    assert(strcmp(calls, "r4 r6 ") == 0);
+    assert(proc_calls == 2 && dumps == 4);  /* per family: raw, and its read-back */
+    for (int fi = 0; fi < 2; fi++) {
+        char foreign[MAX_LINES * LINE_LEN];
+        assert(!nf[fi].guard_exists && nf[fi].guard_len == 0 && raw_jumps(fi) == 0);
+        raw_foreign(&nf[fi], foreign, sizeof(foreign));
+        assert(strcmp(foreign, saved_foreign[fi]) == 0 && strstr(foreign, FOREIGN_RAW2));
+    }
+    assert(warns == 0 && errors == 0);
+    assert_mangle_unchanged();
+
+    /* Nothing left: read, nothing written. */
+    reset();
+    assert(raw_guard_remove() == 0);
+    assert(calls[0] == '\0' && dumps == 2 && proc_calls == 2);
+
+    /* A raw table the kernel does not list has no rules and is not even read
+     * (reading it would load its module); a list that cannot be read is no
+     * evidence, so that family is read. */
+    reset();
+    raw_listed[1] = 0;
+    assert(raw_guard_remove() == 0);
+    assert(dumps == 1 && proc_calls == 2);
+    reset();
+    raw_listed[1] = -1;
+    assert(raw_guard_remove() == 0);
+    assert(dumps == 2 && calls[0] == '\0');
+    raw_listed[1] = 1;
+
+    /* A running daemon (RawGuard=true) puts it back on its next commit, which
+     * is why hrneo --raw-off refuses while one holds the lock (check_raw_start). */
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r4 r6 ") == 0);
+    assert_raw(0, 0xff2);
+    assert_raw(1, 0xff2);
+
+    /* RawGuard=false: the next commit takes it down, later ones do not look;
+     * with RawGuard=true again it comes back. */
+    reset();
+    cfg->raw_guard = 0;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r4 r6 ") == 0);
+    assert(!nf[0].guard_exists && !nf[1].guard_exists);
+    assert(status_has("raw_guard=off"));
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(calls[0] == '\0' && dumps == 2 && proc_calls == 0);
+    cfg->raw_guard = 1;
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r4 r6 ") == 0);
+    assert_raw(0, 0xff2);
+    assert_raw(1, 0xff2);
+    assert(status_has("raw_guard=on"));
+    assert_mangle_unchanged();
+}
+
 static void check_cleanup(const unified_target_t *t, const config_t *cfg) {
     ipset_pair_t pairs[2] = {t[0].pair, t[1].pair};
 
@@ -1126,6 +1222,7 @@ int main(void) {
     check_overflow(t, &cfg);
     check_policy_mark_change(t, &cfg);
     check_mark_change_failures(t, &cfg);
+    check_raw_off(t, &cfg);
     check_cleanup(t, &cfg);
     puts("check_connmark: OK");
     return 0;

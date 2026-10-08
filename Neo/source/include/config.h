@@ -5,6 +5,7 @@
 
 int config_read(const char *path, config_t *cfg);
 int config_generate(const char *target);
+int config_flush_ipsets_on_start(const config_t *cfg);
 
 typedef enum {
     KTOKEN_ADDED,

@@ -1,7 +1,11 @@
 #include "../include/util.h"
 #include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 int main(void) {
     const char *batch = "*mangle\n-D PREROUTING -j GONE\nCOMMIT\n";
@@ -50,6 +54,33 @@ int main(void) {
     assert(proc_list_has(names, "table01") == 1);
     assert(proc_list_has(names, "raw") == -1);
     remove(names);
+
+    /* hrneo's lock: one holder at a time, never waited for, close-on-exec so
+     * no command it runs keeps it, and gone with its holder. */
+    const char *lock = "build/check_run_command.lock";
+    remove(lock);
+    int fd = lock_acquire(lock);
+    assert(fd >= 0);
+    assert(fcntl(fd, F_GETFD) & FD_CLOEXEC);
+    assert(lock_acquire(lock) == LOCK_HELD);        /* even in the same process */
+    fflush(NULL);
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) _exit(lock_acquire(lock) == LOCK_HELD ? 0 : 1);
+    int st;
+    assert(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* A command run with it held does not get it. */
+    char *probe[] = {"sh", "-c", "ls -l /proc/$$/fd | grep -q check_run_command.lock && exit 1; exit 0", NULL};
+    char out[256];
+    assert(run_command_output("sh", probe, out, sizeof(out)) == 0);
+    close(fd);
+    fd = lock_acquire(lock);
+    assert(fd >= 0);
+    close(fd);
+    /* No directory for it: an error with errno, not "held". */
+    errno = 0;
+    assert(lock_acquire("build/no-such-dir/hrneo.lock") == -1 && errno == ENOENT);
+    remove(lock);
 
     puts("check_run_command: OK");
     return 0;

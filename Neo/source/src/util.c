@@ -1,6 +1,7 @@
 #include "../include/util.h"
 #include <stdio.h>
 #include <ctype.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -273,4 +274,17 @@ int run_command_stdin(const char *cmd, char *const argv[], const char *input, si
     int status;
     waitpid(pid, &status, 0);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+int lock_acquire(const char *path) {
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    while (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        int err = errno;
+        if (err == EINTR) continue;
+        close(fd);
+        errno = err;
+        return err == EWOULDBLOCK ? LOCK_HELD : -1;
+    }
+    return fd;
 }

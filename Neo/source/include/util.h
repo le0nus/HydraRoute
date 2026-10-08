@@ -21,5 +21,11 @@ const char *line_find(const char *line, size_t line_len, const char *needle);
 /* A /proc list of names, one per line (/proc/net/ip_tables_names): 1 if name
  * is listed, 0 if the whole list was read and it is not, -1 if unknown. */
 int proc_list_has(const char *path, const char *name);
+/* An exclusive flock on path (created if missing), taken without waiting
+ * and held until the fd is closed or the process exits; the fd is
+ * close-on-exec, so no command the holder runs keeps it. Returns the fd,
+ * LOCK_HELD if another holder has it, or -1 with errno set. */
+#define LOCK_HELD (-2)
+int lock_acquire(const char *path);
 
 #endif

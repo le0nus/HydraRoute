@@ -35,6 +35,12 @@ static void print_help(void) {
            "exit code: 0 match, 1 no match, 2 error");
     printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--dump",
            "Print the running daemon's watchlist");
+    printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--raw-off",
+           "Remove the raw guard chain (HRNEO_GUARD) and exit");
+    printf("  %-*s    %s\n", HELP_FLAG_WIDTH, "",
+           "hrneo must be stopped (exit code 2 if it runs);");
+    printf("  %-*s    %s\n", HELP_FLAG_WIDTH, "",
+           "its next start with RawGuard=true puts the chain back");
     printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--version, -v", "Print version and exit");
     printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--help, -h",    "Print this help and exit");
     printf("\nPriority: CLI flags > config file > built-in defaults\n");
@@ -85,6 +91,8 @@ int args_parse(int argc, char *argv[], cli_args_t *out) {
             out->api_command = "DUMP";
             return 5;
         }
+        if (strcmp(arg, "--raw-off") == 0)
+            return 6;
         if (strcmp(arg, "--keenetic") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "hrneo: missing value for --keenetic\n");

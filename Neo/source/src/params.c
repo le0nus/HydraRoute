@@ -21,7 +21,7 @@ const param_def_t PARAMS[] = {
     { "clearIPSet",           "--clearIPSet",           PT_BOOL,
       offsetof(config_t, clear_ipset),            0,
       BIT(2),  0,            1,
-      "<true|false>",            "Flush ipsets on startup",                    "true"  },
+      "<true|false>",            "Flush ipsets on startup if KeepIpsetOnRestart=false", "true" },
 
     { "CIDR",                 "--CIDR",                 PT_BOOL,
       offsetof(config_t, cidr_enabled),           0,
@@ -90,6 +90,11 @@ const param_def_t PARAMS[] = {
       offsetof(config_t, raw_guard),              0,
       BIT(30), 0,            1,
       "<true|false>",            "Mark policy traffic in iptables raw (leak guard)", "true"  },
+
+    { "KeepIpsetOnRestart",   "--KeepIpsetOnRestart",   PT_BOOL,
+      offsetof(config_t, keep_ipset_on_restart),  0,
+      BIT(31), 0,            1,
+      "<true|false>",            "Keep ipsets across restarts even with clearIPSet=true", "true"  },
 
     { "IpsetMaxElem",         "--IpsetMaxElem",         PT_INT_POS,
       offsetof(config_t, ipset_maxelem),          0,
