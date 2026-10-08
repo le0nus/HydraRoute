@@ -7,6 +7,7 @@
 #define IPT_DUMP_SIZE       65536
 #define IPT_BATCH_SIZE      65536
 #define IPT_MAX_RULE_ARGS   64
+#define IPT_MAX_OWNED       512
 
 typedef struct {
     ipset_pair_t pair;

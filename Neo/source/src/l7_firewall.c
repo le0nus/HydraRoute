@@ -134,6 +134,18 @@ int l7_firewall_load_kmod(const char *module_name) {
     return 0;
 }
 
+/* Loads a module when its .ko file exists. Without the file there is nothing
+ * to load: the module may be built into the kernel, or not be there at all.
+ * That is not decided here; a successful iptables-restore of rules that use
+ * it, and the audit after it, show whether the kernel has it. */
+int l7_firewall_load_kmod_if_present(const char *module_name) {
+    char path[512];
+    if (module_already_loaded(module_name) ||
+        find_kmod_path(module_name, path, sizeof(path)) != 0)
+        return 0;
+    return l7_firewall_load_kmod(module_name);
+}
+
 int l7_firewall_load_nflog_modules(void) {
     if (l7_firewall_load_kmod("nfnetlink_log") != 0) return -1;
     if (l7_firewall_load_kmod("xt_NFLOG") != 0) return -1;
