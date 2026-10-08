@@ -4,9 +4,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <linux/netlink.h>
 #include <linux/netfilter/nfnetlink.h>
 
@@ -44,49 +46,120 @@ static int nla_put_raw(uint8_t *buf, uint16_t type, const uint8_t *data, int dat
     return NLA_ALIGN(nla_len);
 }
 
+/* What came instead of the answer to a request (Ruling 50). */
+#define NL_LOST     (-1)    /* recv failed, or nothing came within IPSET_NL_TIMEOUT_MS (errno) */
+#define NL_STEP     (-2)    /* a cut message, or one for a later request: out of step */
+#define NL_PARTIAL  (-3)    /* a batch was sent only in part */
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* socket + bind + SO_RCVTIMEO: the receive timeout bounds every recv, so an
+ * answer the kernel never sends cannot hold up the main loop. */
+static int nl_open(ipset_manager_t *mgr) {
+    struct sockaddr_nl sa;
+    struct timeval tv = {IPSET_NL_TIMEOUT_MS / 1000, IPSET_NL_TIMEOUT_MS % 1000 * 1000};
+    const char *what = "socket";
+    mgr->fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
+    if (mgr->fd >= 0) {
+        memset(&sa, 0, sizeof(sa));
+        sa.nl_family = AF_NETLINK;
+        sa.nl_pid = 0;
+        what = "bind";
+        if (bind(mgr->fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+            what = "setsockopt SO_RCVTIMEO";
+            if (setsockopt(mgr->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0)
+                return 0;
+        }
+        int err = errno;
+        close(mgr->fd);
+        mgr->fd = -1;
+        errno = err;
+    }
+    LOG_ERROR("netlink %s: %s", what, strerror(errno));
+    return -1;
+}
+
+/* A socket left without one (a reopen that failed) gets a new one here. */
+static int nl_ready(ipset_manager_t *mgr) {
+    return mgr->fd >= 0 || nl_open(mgr) == 0 ? 0 : -1;
+}
+
+/* After a batch sent in part, or an answer lost, late or out of step (err:
+ * the errno of a lost one), the answers on this socket can no longer be told
+ * apart from the next request's: the socket is replaced, with what it holds
+ * and what still comes for it, and the next request starts on an empty
+ * queue. The sequence numbers go on, so an answer from before can only ever
+ * be an older one. */
+static void nl_reopen(ipset_manager_t *mgr, int why, int err) {
+    const char *cause = why == NL_PARTIAL ? "batch sent only in part"
+                      : why == NL_STEP ? "answer out of step"
+                      : err == EAGAIN || err == EWOULDBLOCK || err == ETIMEDOUT
+                        ? "no answer in time" : strerror(err);
+    LOG_WARN("ipset netlink: %s, socket reopened", cause);
+    if (mgr->fd >= 0) close(mgr->fd);
+    mgr->fd = -1;
+    nl_open(mgr);
+}
+
+/* Receives the answer to request seq into resp and returns its length.
+ * Answers to older requests (whatever left them queued) are skipped, all
+ * within IPSET_NL_TIMEOUT_MS of the call; each recv is bounded by
+ * SO_RCVTIMEO. NL_LOST or NL_STEP otherwise: the caller reopens. */
+static int nl_recv_answer(ipset_manager_t *mgr, uint32_t seq, uint8_t *resp, int size) {
+    int64_t deadline = now_ms() + IPSET_NL_TIMEOUT_MS;
+    for (;;) {
+        int n = recv(mgr->fd, resp, size, 0);
+        if (n < 0) {
+            if (errno != EINTR) return NL_LOST;
+        } else if (n < (int)NLMSG_HDRLEN) {
+            return NL_STEP;
+        } else {
+            int32_t age = (int32_t)(seq - ((const struct nlmsghdr *)resp)->nlmsg_seq);
+            if (age == 0) return n;
+            if (age < 0) return NL_STEP;
+        }
+        if (now_ms() >= deadline) {
+            errno = ETIMEDOUT;
+            return NL_LOST;
+        }
+    }
+}
+
+/* The ACK of request seq: 0 with *error its result (0, or the positive
+ * errno of the kernel), or what nl_recv_answer returned. */
+static int nl_recv_ack(ipset_manager_t *mgr, uint32_t seq, int *error) {
+    uint8_t resp[256];
+    int n = nl_recv_answer(mgr, seq, resp, sizeof(resp));
+    if (n < 0) return n;
+    if (n < (int)(NLMSG_HDRLEN + sizeof(struct nlmsgerr)) ||
+        ((const struct nlmsghdr *)resp)->nlmsg_type != NLMSG_ERROR)
+        return NL_STEP;
+    *error = -((const struct nlmsgerr *)(resp + NLMSG_HDRLEN))->error;
+    return 0;
+}
+
 static int nl_send_recv_ack(ipset_manager_t *mgr, uint8_t *buf, int len) {
+    if (nl_ready(mgr) != 0) return -1;
     if (send(mgr->fd, buf, len, 0) < 0) {
         LOG_ERROR("netlink send: %s", strerror(errno));
         return -1;
     }
-
-    uint8_t resp[512];
-    int n = recv(mgr->fd, resp, sizeof(resp), 0);
-    if (n < 0) {
-        LOG_ERROR("netlink recv: %s", strerror(errno));
+    int error = 0;
+    int rc = nl_recv_ack(mgr, ((struct nlmsghdr *)buf)->nlmsg_seq, &error);
+    if (rc != 0) {
+        nl_reopen(mgr, rc, errno);
         return -1;
     }
-
-    struct nlmsghdr *nh = (struct nlmsghdr *)resp;
-    if (nh->nlmsg_type == NLMSG_ERROR) {
-        struct nlmsgerr *err = (struct nlmsgerr *)((uint8_t *)nh + NLMSG_HDRLEN);
-        if (err->error != 0) {
-            return -err->error;
-        }
-    }
-    return 0;
+    return error;
 }
 
 int ipset_manager_init(ipset_manager_t *mgr) {
     memset(mgr, 0, sizeof(*mgr));
-    mgr->fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
-    if (mgr->fd < 0) {
-        LOG_ERROR("netlink socket: %s", strerror(errno));
-        return -1;
-    }
-
-    struct sockaddr_nl sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.nl_family = AF_NETLINK;
-    sa.nl_pid = 0;
-
-    if (bind(mgr->fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        LOG_ERROR("netlink bind: %s", strerror(errno));
-        close(mgr->fd);
-        mgr->fd = -1;
-        return -1;
-    }
-
+    if (nl_open(mgr) != 0) return -1;
     mgr->seq = 1;
     mgr->pid = getpid();
     return 0;
@@ -120,11 +193,15 @@ static int ipset_query_revision(ipset_manager_t *mgr, const char *type, int fami
     offset += nla_put_u8(buf + offset, IPSET_ATTR_FAMILY, nf_family);
     nlh->nlmsg_len = offset;
 
-    if (send(mgr->fd, buf, offset, 0) < 0)
+    if (nl_ready(mgr) != 0 || send(mgr->fd, buf, offset, 0) < 0)
         return 0;
 
     uint8_t resp[512];
-    int n = recv(mgr->fd, resp, sizeof(resp), 0);
+    int n = nl_recv_answer(mgr, nlh->nlmsg_seq, resp, sizeof(resp));
+    if (n < 0) {
+        nl_reopen(mgr, n, errno);
+        return 0;
+    }
     if (n < (int)(NLMSG_HDRLEN + 4))
         return 0;
 
@@ -475,70 +552,65 @@ int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
 
         if (msg_count == 0) continue;
 
-        /* Entries added without timeout are the permanent ones. If one of them
-         * is not known to have been acknowledged (send/recv failure, wrong or
-         * short answer, a kernel error), it may be in the set without being in
-         * the index: stop refreshing that set. */
-        for (int i = 0; i < msg_count; i++) {
-            if (send(mgr->fd, msg_bufs[i], msg_lens[i], 0) < 0) {
-                LOG_ERROR("netlink send batch: %s", strerror(errno));
-                if (!with_timeout) ipset_perm_mark_incomplete(mgr, set_name_nul);
-                return -1;
-            }
+        if (nl_ready(mgr) != 0) {
+            if (!with_timeout) ipset_perm_mark_incomplete(mgr, set_name_nul);
+            return -1;
         }
+        int sent = 0;
+        while (sent < msg_count && send(mgr->fd, msg_bufs[sent], msg_lens[sent], 0) >= 0)
+            sent++;
+        if (sent < msg_count)
+            LOG_ERROR("netlink send batch: %s", strerror(errno));
 
         int refresh[IPSET_CHUNK_SIZE];
         int refresh_count = 0;
 
-        for (int i = 0; i < msg_count; i++) {
-            uint8_t resp[256];
-            int n;
-            do {
-                n = recv(mgr->fd, resp, sizeof(resp), 0);
-            } while (n < 0 && errno == EINTR);
-
-            struct nlmsghdr *nh = (struct nlmsghdr *)resp;
-            if (n < (int)(NLMSG_HDRLEN + sizeof(struct nlmsgerr)) ||
-                nh->nlmsg_type != NLMSG_ERROR ||
-                nh->nlmsg_seq != ((struct nlmsghdr *)msg_bufs[i])->nlmsg_seq) {
-                if (!with_timeout) {
-                    LOG_WARN("ipset '%s': no valid answer to an ADD (%s)", set_name,
-                             n < 0 ? strerror(errno) : "short or foreign message");
-                    ipset_perm_mark_incomplete(mgr, set_name_nul);
-                    result = -1;
-                }
-                continue;
+        /* The answers come in the order of the requests, each with its
+         * sequence. One that is lost or out of step leaves the rest unknown. */
+        int answered = 0, rc = sent < msg_count ? NL_PARTIAL : 0, lost_errno = 0;
+        for (; answered < sent; answered++) {
+            int i = answered, error = 0;
+            int r = nl_recv_ack(mgr, ((struct nlmsghdr *)msg_bufs[i])->nlmsg_seq, &error);
+            if (r != 0) {
+                rc = r;
+                lost_errno = errno;
+                break;
             }
-
-            struct nlmsgerr *err = (struct nlmsgerr *)((uint8_t *)nh + NLMSG_HDRLEN);
             const parsed_cidr_t *entry = &entries[valid_indices[i]];
-            if (err->error == 0) {
+            if (error == 0) {
                 if (with_timeout && new_indices) {
                     new_indices[*new_count] = valid_indices[i];
                     (*new_count)++;
                 } else if (!with_timeout && has_timeout) {
                     remember_permanent(mgr, set_name_nul, entry);
                 }
+            } else if (error == IPSET_ERR_EXIST) {
+                if (!with_timeout && has_timeout) {
+                    remember_permanent(mgr, set_name_nul, entry);
+                } else if (has_timeout && with_timeout &&
+                           !ipset_perm_incomplete(mgr, set_name_nul) &&
+                           !is_permanent(mgr, set_name_nul, entry)) {
+                    refresh[refresh_count++] = i;
+                }
+            } else if (error == IPSET_ERR_HASH_FULL) {
+                LOG_WARN("ipset '%s' full (maxelem exceeded): set IpsetMaxElem in config", set_name);
             } else {
-                int errcode = -err->error;
-                if (errcode == IPSET_ERR_EXIST) {
-                    if (!with_timeout && has_timeout) {
-                        remember_permanent(mgr, set_name_nul, entry);
-                    } else if (has_timeout && with_timeout &&
-                               !ipset_perm_incomplete(mgr, set_name_nul) &&
-                               !is_permanent(mgr, set_name_nul, entry)) {
-                        refresh[refresh_count++] = i;
-                    }
-                } else if (errcode == IPSET_ERR_HASH_FULL) {
-                    LOG_WARN("ipset '%s' full (maxelem exceeded): set IpsetMaxElem in config", set_name);
-                } else {
-                    LOG_DEBUG("Netlink ADD error: errno=%d", errcode);
-                    if (!with_timeout) {
-                        ipset_perm_mark_incomplete(mgr, set_name_nul);
-                        result = -1;
-                    }
+                LOG_DEBUG("Netlink ADD error: errno=%d", error);
+                if (!with_timeout) {
+                    ipset_perm_mark_incomplete(mgr, set_name_nul);
+                    result = -1;
                 }
             }
+        }
+
+        /* Entries added without timeout are the permanent ones. One not known
+         * to be acknowledged (not sent, its answer lost or out of step) may be
+         * in the set without being in the index: stop refreshing that set.
+         * A DNS entry left out comes again with the next answer. */
+        if (rc != 0) {
+            nl_reopen(mgr, rc, lost_errno);
+            if (!with_timeout) ipset_perm_mark_incomplete(mgr, set_name_nul);
+            result = -1;
         }
 
         /* NLM_F_EXCL tells new IPs apart but also keeps the kernel from touching an
@@ -547,9 +619,10 @@ int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
             struct nlmsghdr *h = (struct nlmsghdr *)msg_bufs[refresh[r]];
             h->nlmsg_flags &= ~NLM_F_EXCL;
             h->nlmsg_seq = mgr->seq++;
-            int rc = nl_send_recv_ack(mgr, msg_bufs[refresh[r]], msg_lens[refresh[r]]);
-            if (rc != 0) LOG_DEBUG("Netlink timeout refresh error: errno=%d", rc);
+            int err = nl_send_recv_ack(mgr, msg_bufs[refresh[r]], msg_lens[refresh[r]]);
+            if (err != 0) LOG_DEBUG("Netlink timeout refresh error: errno=%d", err);
         }
+        if (sent < msg_count) return -1;
     }
 
     return result;

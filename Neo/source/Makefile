@@ -111,7 +111,7 @@ check:
 	./build/check_routing
 	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=ipset_refresh_set_list,--wrap=ipset_add_batch,--wrap=log_write,--wrap=malloc,--wrap=realloc tests/check_cidr_load.c src/geodat.c src/ipset_nl.c src/util.c src/log.c -o build/check_cidr_load
 	./build/check_cidr_load
-	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=send,--wrap=recv,--wrap=realloc,--wrap=log_write tests/check_ipset_refresh.c src/ipset_nl.c src/util.c src/log.c -o build/check_ipset_refresh
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=socket,--wrap=bind,--wrap=setsockopt,--wrap=close,--wrap=send,--wrap=recv,--wrap=clock_gettime,--wrap=realloc,--wrap=log_write tests/check_ipset_refresh.c src/ipset_nl.c src/util.c src/log.c -o build/check_ipset_refresh
 	./build/check_ipset_refresh
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_packet_capture.c src/packet_capture.c src/log.c src/util.c -o build/check_packet_capture
 	./build/check_packet_capture

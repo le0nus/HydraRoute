@@ -6,6 +6,14 @@
 
 #define IPSET_MAX_SETS 512
 
+/* The wait for one netlink answer (Ruling 50): SO_RCVTIMEO of every recv,
+ * and the time within which answers to older requests are skipped. A
+ * request whose answer does not come, a batch sent in part or an answer out
+ * of step replaces the socket, so no answer left behind reaches the next
+ * request; an ADD without timeout whose result is not known marks its set
+ * incomplete. */
+#define IPSET_NL_TIMEOUT_MS 1000
+
 /* Host entries (/32, /128) a CIDR list added without timeout, per set: a DNS
  * answer for such an IP must not give it IpsetTimeout. Keys are appended while
  * the lists load, sorted and deduplicated once at the first lookup after that,
