@@ -101,7 +101,7 @@ check:
 	./build/check_rci
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_config.c src/config.c src/params.c src/args.c src/util.c src/log.c -o build/check_config
 	./build/check_config
-	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=ipset_create,--wrap=ipset_flush,--wrap=add_cidr_to_ipsets,--wrap=log_write,--wrap=send,--wrap=recv tests/check_ipset_start.c src/ipset_start.c src/ipset_nl.c src/config.c src/params.c src/args.c src/util.c src/log.c -o build/check_ipset_start
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=ipset_create,--wrap=ipset_flush,--wrap=add_cidr_to_ipsets,--wrap=ipset_refresh_set_list,--wrap=log_write,--wrap=send,--wrap=recv tests/check_ipset_start.c src/ipset_start.c src/geodat.c src/ipset_nl.c src/config.c src/params.c src/args.c src/util.c src/log.c -o build/check_ipset_start
 	./build/check_ipset_start
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_watchlist.c src/watchlist.c src/util.c src/log.c -o build/check_watchlist
 	./build/check_watchlist

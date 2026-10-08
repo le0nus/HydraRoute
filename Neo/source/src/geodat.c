@@ -18,13 +18,13 @@ static int read_varint(const uint8_t *data, int len, int pos, uint64_t *out_val)
 
     while (pos < len) {
         uint8_t b = data[pos++];
+        if (shift == 63 && b > 1) return -1;    /* a 10th byte holds bit 63 only */
         val |= (uint64_t)(b & 0x7F) << shift;
         if (!(b & 0x80)) {
             *out_val = val;
             return pos - start;
         }
         shift += 7;
-        if (shift >= 64) return -1;
     }
     return -1;
 }
@@ -37,6 +37,7 @@ static int read_varint_stream(FILE *f, uint64_t *out_val) {
     while (1) {
         int b = fgetc(f);
         if (b == EOF) return -1;
+        if (shift == 63 && b > 1) return -1;    /* a 10th byte holds bit 63 only */
         count++;
         val |= (uint64_t)(b & 0x7F) << shift;
         if (!(b & 0x80)) {
@@ -44,7 +45,6 @@ static int read_varint_stream(FILE *f, uint64_t *out_val) {
             return count;
         }
         shift += 7;
-        if (shift >= 64) return -1;
     }
 }
 
@@ -60,6 +60,9 @@ static int pb_next_field(const uint8_t *data, int len, int *pos, pb_field_t *out
     if (*pos >= len) return 0;
 
     uint8_t tag = data[(*pos)++];
+    /* Fields 1-15, one-byte tags: all these files use. A longer tag read as
+     * one byte would shift every field after it. */
+    if (tag & 0x80) return -1;
     out->field = tag >> 3;
     out->wire_type = tag & 0x07;
 
@@ -83,12 +86,15 @@ static int pb_next_field(const uint8_t *data, int len, int *pos, pb_field_t *out
     return -1;
 }
 
-/* 0 an entry, 1 a valid all-zero network (skipped on purpose), -1 malformed. */
+/* 0 an entry, 1 a valid all-zero network (skipped on purpose), -1 malformed:
+ * a broken field, no address, field 0 or an address or prefix field of the
+ * wrong type, a prefix longer than the address. */
 static int parse_cidr_body(const uint8_t *data, int len, geoip_entry_t *entry) {
     memset(entry, 0, sizeof(*entry));
     int pos = 0;
     int rc;
     pb_field_t f;
+    uint64_t prefix = 0;            /* range-checked before it is narrowed */
 
     while ((rc = pb_next_field(data, len, &pos, &f)) == 1) {
         if (f.field == 1 && f.wire_type == 2) {
@@ -96,10 +102,13 @@ static int parse_cidr_body(const uint8_t *data, int len, geoip_entry_t *entry) {
             memcpy(entry->ip, f.body, f.body_len);
             entry->ip_len = (uint8_t)f.body_len;
         } else if (f.field == 2 && f.wire_type == 0) {
-            entry->prefix = (uint32_t)f.varint;
+            prefix = f.varint;
+        } else if (f.field <= 2) {
+            return -1;
         }
     }
-    if (rc < 0 || entry->ip_len == 0) return -1;
+    if (rc < 0 || entry->ip_len == 0 || prefix > entry->ip_len * 8u) return -1;
+    entry->prefix = (uint32_t)prefix;
 
     int all_zero = 1;
     for (int i = 0; i < 16; i++) {
@@ -111,7 +120,10 @@ static int parse_cidr_body(const uint8_t *data, int len, geoip_entry_t *entry) {
 }
 
 /* fn returns nonzero when it could not keep the entry (no memory). The walk
- * returns -1 if it stopped early or met a malformed entry, or fn dropped one. */
+ * returns -1 if it stopped early or met a malformed entry, or fn dropped one.
+ * Unknown fields (4-15) are skipped, as protobuf says. Field 0, a second
+ * country code (the record may be another country's), an entry or
+ * reverse_match of the wrong type are malformed. */
 typedef int (*geoip_cidr_fn)(const geoip_entry_t *entry, void *ctx);
 
 static int for_each_geoip_cidr(const uint8_t *data, int len,
@@ -121,7 +133,8 @@ static int for_each_geoip_cidr(const uint8_t *data, int len,
     pb_field_t f;
 
     while ((rc = pb_next_field(data, len, &pos, &f)) == 1) {
-        if (f.field != 2 || f.wire_type != 2) continue;
+        if (f.field > 3 || (f.field == 3 && f.wire_type == 0)) continue;
+        if (f.field != 2 || f.wire_type != 2) return -1;
         geoip_entry_t entry;
         int pr = parse_cidr_body(f.body, f.body_len, &entry);
         if (pr < 0) return -1;
