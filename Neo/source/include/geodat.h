@@ -13,6 +13,10 @@ int build_geosite_domain_map(const char (*file_paths)[512], int file_count,
 
 int parse_cidr_policy_headers(const char *path, char names[][64], int max_names);
 
+/* Loads the CIDR list into the target sets. 0 on success, -ENOENT when the
+ * file is missing (an empty list), otherwise -errno of what was lost: the file
+ * could not be read, an entry was dropped for lack of memory, a batch could
+ * not be sent. */
 int add_cidr_to_ipsets(ipset_manager_t *mgr, const char *cidr_path,
                        const char (*geoip_files)[512], int geoip_count,
                        uint32_t maxelem);

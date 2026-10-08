@@ -2,6 +2,8 @@
 #include "../include/config.h"
 #include "../include/ipset_start.h"
 #include <assert.h>
+#include <errno.h>
+#include <linux/netlink.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -13,6 +15,27 @@
 #define CONF_PATH "build/check_ipset_start.conf"
 
 static char calls[1024], info_log[1024];
+static int cidr_result;               /* what the faked CIDR load returns */
+static ipset_manager_t mgr;           /* the manager of the last start */
+static int sent_count, next_reply;    /* fake kernel for the DNS step */
+static uint16_t sent_flags[4];
+
+ssize_t __wrap_send(int fd, const void *buf, size_t len, int flags) {
+    (void)fd; (void)flags;
+    sent_flags[sent_count++] = ((const struct nlmsghdr *)buf)->nlmsg_flags;
+    return (ssize_t)len;
+}
+
+ssize_t __wrap_recv(int fd, void *buf, size_t len, int flags) {
+    (void)fd; (void)flags;
+    memset(buf, 0, len);
+    struct nlmsghdr *h = buf;
+    struct nlmsgerr *e = (struct nlmsgerr *)((uint8_t *)buf + NLMSG_HDRLEN);
+    h->nlmsg_type = NLMSG_ERROR;
+    h->nlmsg_len = NLMSG_HDRLEN + sizeof(*e);
+    e->error = -next_reply;
+    return (ssize_t)h->nlmsg_len;
+}
 extern int log_enabled;
 
 int __wrap_ipset_create(ipset_manager_t *mgr, const char *name, const char *type, int family,
@@ -34,7 +57,7 @@ int __wrap_add_cidr_to_ipsets(ipset_manager_t *mgr, const char *cidr_path,
                               const char (*geoip_files)[512], int geoip_count, uint32_t maxelem) {
     (void)mgr; (void)geoip_files; (void)geoip_count; (void)maxelem;
     snprintf(calls + strlen(calls), sizeof(calls) - strlen(calls), "cidr %s,", cidr_path);
-    return 0;
+    return cidr_result;
 }
 
 void __wrap_log_write(const char *fmt, ...) {
@@ -57,7 +80,6 @@ static void start(const char *conf, int argc, char **argv) {
     assert(config_read(CONF_PATH, &cfg) == 0);
     assert(args_parse(argc, argv, &args) == 0);
     args_apply(&args, &cfg);
-    ipset_manager_t mgr;
     memset(&mgr, 0, sizeof(mgr));
     mgr.default_timeout = 21600;
     calls[0] = info_log[0] = '\0';
@@ -102,6 +124,55 @@ int main(void) {
     start("CIDR=false\n", 5, clean);
     assert(strcmp(calls, CREATE "flush RU,flush RUv6," CREATE_HR
                          "flush HydraRoute,flush HydraRoutev6,") == 0);
+
+    /* A CIDR list that did not load (anything but a missing file) leaves the
+     * permanent hosts of the kept sets unknown: no set of any target refreshes
+     * its existing entries, every one says so once. A missing file is an empty
+     * list: the index is complete. */
+    static const int failures[] = {-EIO, -EACCES, -ENOMEM, -EISDIR};
+    for (size_t i = 0; i < sizeof(failures) / sizeof(failures[0]); i++) {
+        cidr_result = failures[i];
+        start("", 1, plain);
+        assert(strcmp(calls, CREATE CREATE_HR CIDR) == 0);
+        assert(ipset_perm_incomplete(&mgr, "RU") && ipset_perm_incomplete(&mgr, "RUv6"));
+        assert(ipset_perm_incomplete(&mgr, "HydraRoute") && ipset_perm_incomplete(&mgr, "HydraRoutev6"));
+        assert(!ipset_perm_incomplete(&mgr, "Foreign"));
+        assert(strstr(info_log, "permanent-host index incomplete for HydraRoute: refresh disabled"));
+        assert(strstr(info_log, "permanent-host index incomplete for RUv6: refresh disabled"));
+    }
+    cidr_result = -ENOENT;
+    start("", 1, plain);
+    assert(!ipset_perm_incomplete(&mgr, "RU") && !ipset_perm_incomplete(&mgr, "HydraRoute"));
+    assert(!strstr(info_log, "incomplete"));
+    cidr_result = 0;
+    start("", 1, plain);
+    assert(!ipset_perm_incomplete(&mgr, "HydraRoute") && !strstr(info_log, "incomplete"));
+
+    /* End to end: the kernel kept a permanent host (timeout 0) from the last
+     * run, the list cannot be read, a DNS answer names that host. Its entry is
+     * left as it is: the exclusive ADD is the only message sent. */
+    parsed_cidr_t host;
+    memset(&host, 0, sizeof(host));
+    host.family = AF_INET;
+    host.prefix = 32;
+    host.ip[0] = 198; host.ip[1] = 51; host.ip[2] = 100; host.ip[3] = 7;
+    int new_count, new_idx[1];
+    cidr_result = -EIO;
+    start("", 1, plain);
+    mgr.fd = 3;
+    sent_count = 0;
+    next_reply = IPSET_ERR_EXIST;
+    assert(ipset_add_batch(&mgr, "HydraRoute", &host, 1, 1, &new_count, new_idx) == 0);
+    assert(sent_count == 1 && (sent_flags[0] & NLM_F_EXCL));
+    /* With the list read (or absent) the same answer would refresh a DNS entry. */
+    cidr_result = -ENOENT;
+    start("", 1, plain);
+    mgr.fd = 3;
+    sent_count = 0;
+    assert(ipset_add_batch(&mgr, "HydraRoute", &host, 1, 1, &new_count, new_idx) == 0);
+    assert(sent_count == 2 && !(sent_flags[1] & NLM_F_EXCL));
+    mgr.fd = -1;
+    ipset_manager_close(&mgr);
 
     remove(CONF_PATH);
     puts("check_ipset_start: OK");

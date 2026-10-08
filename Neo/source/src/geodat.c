@@ -803,7 +803,7 @@ typedef void (*cidr_entry_fn)(const cidr_block_t *blk, const char *entry, void *
 static int scan_cidrfile_blocks(const char *path, ipset_manager_t *mgr,
                                  cidr_entry_fn on_entry, void *ctx, int verbose) {
     FILE *f = fopen(path, "r");
-    if (!f) return -1;
+    if (!f) return -1;     /* errno from fopen */
 
     char *line = NULL;
     size_t cap = 0;
@@ -852,7 +852,13 @@ static int scan_cidrfile_blocks(const char *path, ipset_manager_t *mgr,
         if (on_entry) on_entry(&blk, payload, ctx);
     }
     free(line);
+    /* getline() also returns -1 on a read error; the rest of the file is then unread. */
+    int io_err = ferror(f) ? (errno ? errno : EIO) : 0;
     fclose(f);
+    if (io_err) {
+        errno = io_err;
+        return -1;
+    }
     return 0;
 }
 
@@ -926,6 +932,8 @@ typedef struct {
     ipset_usage_t *usage;
     int           *usage_count;
     name_index_t  *usage_index;
+
+    int            failed;   /* an entry was lost to an allocation failure */
 } phase2_ctx_t;
 
 static const char *batch_name_at(const void *base, int idx) {
@@ -1048,7 +1056,7 @@ static void phase2_on_entry(const cidr_block_t *blk, const char *entry, void *ct
 
                 int bi = batch_find_or_add(cx->batches, cx->batch_count, cx->batch_max,
                                             cx->batch_index, target_set, 4096);
-                if (bi >= 0) batch_push(&cx->batches[bi], &cidr);
+                if (bi < 0 || batch_push(&cx->batches[bi], &cidr) != 0) cx->failed = 1;
             }
             free(entries);
         }
@@ -1094,6 +1102,8 @@ static void phase2_on_entry(const cidr_block_t *blk, const char *entry, void *ct
                                 cx->batch_index, target_set, 256);
     if (bi >= 0 && batch_push(&cx->batches[bi], &cidr) == 0) {
         if (ui >= 0) cx->usage[ui].count++;
+    } else {
+        cx->failed = 1;
     }
 }
 
@@ -1161,10 +1171,18 @@ int add_cidr_to_ipsets(ipset_manager_t *mgr, const char *cidr_path,
         .usage_index = &usage_index,
     };
 
+    int result = 0;
     if (scan_cidrfile_blocks(cidr_path, mgr, phase2_on_entry, &p2, 1) != 0) {
-        LOG_WARN("CIDR file not found: %s", cidr_path);
-        return -1;
+        int err = errno ? errno : EIO;
+        if (err == ENOENT) {
+            LOG_WARN("CIDR file not found: %s", cidr_path);
+            return -ENOENT;
+        }
+        /* A read error in the middle: what was read still goes in. */
+        LOG_WARN("CIDR file %s not read to the end: %s", cidr_path, strerror(err));
+        result = -err;
     }
+    if (p2.failed && result == 0) result = -ENOMEM;
 
     for (int i = 0; i < batch_count; i++) {
         if (batches[i].count == 0) {
@@ -1174,12 +1192,13 @@ int add_cidr_to_ipsets(ipset_manager_t *mgr, const char *cidr_path,
         LOG_INFO("Adding %d entries to ipset %s", batches[i].count, batches[i].set_name);
         int new_count = 0;
         int new_indices[1];
-        ipset_add_batch(mgr, batches[i].set_name,
-                        batches[i].entries, batches[i].count,
-                        0, &new_count, new_indices);
+        if (ipset_add_batch(mgr, batches[i].set_name,
+                            batches[i].entries, batches[i].count,
+                            0, &new_count, new_indices) != 0)
+            result = -EIO;
         free(batches[i].entries);
     }
 
     LOG_INFO("CIDR processing complete (processed %d ipsets)", batch_count);
-    return 0;
+    return result;
 }

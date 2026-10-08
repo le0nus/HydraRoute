@@ -95,8 +95,9 @@ int ipset_manager_init(ipset_manager_t *mgr) {
 void ipset_manager_close(ipset_manager_t *mgr) {
     if (mgr->fd >= 0) close(mgr->fd);
     mgr->fd = -1;
-    ht_destroy(mgr->permanent);
-    mgr->permanent = NULL;
+    free(mgr->permanent.keys);
+    free(mgr->permanent.incomplete);
+    memset(&mgr->permanent, 0, sizeof(mgr->permanent));
 }
 
 static int ipset_query_revision(ipset_manager_t *mgr, const char *type, int family) {
@@ -332,33 +333,99 @@ static int is_service_ip(const uint8_t *ip, int family) {
     return (memcmp(ip, zeros, 16) == 0 || memcmp(ip, loopback, 16) == 0);
 }
 
+_Static_assert(sizeof(ipset_perm_key_t) == 81, "permanent key has no padding");
+
 /* CIDR lists add their entries without timeout, i.e. permanently. A host entry
  * (/32, /128) is the same set element as a DNS-learned IP, and refreshing that
  * IP would give it IpsetTimeout, so such entries are remembered per set. */
-static int permanent_key(char *key, const char *set_name_nul, int set_name_len,
-                         const parsed_cidr_t *entry) {
-    int ip_len = entry->family == AF_INET ? 4 : 16;
+static int perm_key(ipset_perm_key_t *k, const char *set_name, const parsed_cidr_t *entry) {
+    size_t ip_len = entry->family == AF_INET ? 4 : 16;
     if (entry->prefix != (uint32_t)ip_len * 8) return 0;
-    memcpy(key, set_name_nul, set_name_len);
-    memcpy(key + set_name_len, entry->ip, ip_len);
-    return set_name_len + ip_len;
+    memset(k, 0, sizeof(*k));
+    snprintf(k->set, sizeof(k->set), "%s", set_name);
+    k->family = (uint8_t)entry->family;
+    memcpy(k->ip, entry->ip, ip_len);
+    return 1;
 }
 
-static void remember_permanent(ipset_manager_t *mgr, const char *set_name_nul,
-                               int set_name_len, const parsed_cidr_t *entry) {
-    char key[64 + 16];
-    int len = permanent_key(key, set_name_nul, set_name_len, entry);
-    if (len == 0) return;
-    if (!mgr->permanent && !(mgr->permanent = ht_create())) return;
-    ht_insert(mgr->permanent, key, len, "permanent");
+static int perm_cmp(const void *a, const void *b) {
+    return memcmp(a, b, sizeof(ipset_perm_key_t));
 }
 
-static int is_permanent(const ipset_manager_t *mgr, const char *set_name_nul,
-                        int set_name_len, const parsed_cidr_t *entry) {
-    if (!mgr->permanent) return 0;
-    char key[64 + 16];
-    int len = permanent_key(key, set_name_nul, set_name_len, entry);
-    return len > 0 && ht_lookup(mgr->permanent, key, len) != NULL;
+int ipset_perm_incomplete(const ipset_manager_t *mgr, const char *set_name) {
+    const ipset_perm_t *p = &mgr->permanent;
+    if (p->all_incomplete) return 1;
+    for (size_t i = 0; i < p->incomplete_count; i++)
+        if (strncmp(p->incomplete[i], set_name, 63) == 0) return 1;
+    return 0;
+}
+
+static void perm_mark_all_incomplete(ipset_manager_t *mgr) {
+    if (mgr->permanent.all_incomplete) return;
+    mgr->permanent.all_incomplete = 1;
+    LOG_WARN("permanent-host index incomplete for all sets: refresh disabled");
+}
+
+void ipset_perm_mark_incomplete(ipset_manager_t *mgr, const char *set_name) {
+    ipset_perm_t *p = &mgr->permanent;
+    if (ipset_perm_incomplete(mgr, set_name)) return;
+    if (p->incomplete_count >= SIZE_MAX / 64 - 1) {
+        perm_mark_all_incomplete(mgr);
+        return;
+    }
+    char (*names)[64] = realloc(p->incomplete, (p->incomplete_count + 1) * 64);
+    if (!names) {
+        /* Cannot even remember the name: the safe side is every set. */
+        perm_mark_all_incomplete(mgr);
+        return;
+    }
+    p->incomplete = names;
+    snprintf(p->incomplete[p->incomplete_count++], 64, "%s", set_name);
+    LOG_WARN("permanent-host index incomplete for %s: refresh disabled", set_name);
+}
+
+static void remember_permanent(ipset_manager_t *mgr, const char *set_name,
+                               const parsed_cidr_t *entry) {
+    ipset_perm_t *p = &mgr->permanent;
+    ipset_perm_key_t k;
+    if (!perm_key(&k, set_name, entry)) return;
+    if (p->count == p->cap) {
+        size_t cap = p->cap ? p->cap * 2 : 4;
+        if (p->cap > SIZE_MAX / 2 || cap > SIZE_MAX / sizeof(*p->keys)) {
+            ipset_perm_mark_incomplete(mgr, set_name);
+            return;
+        }
+        ipset_perm_key_t *keys = realloc(p->keys, cap * sizeof(*keys));
+        if (!keys) {
+            ipset_perm_mark_incomplete(mgr, set_name);
+            return;
+        }
+        p->keys = keys;
+        p->cap = cap;
+    }
+    p->keys[p->count++] = k;
+    p->sorted = 0;
+}
+
+/* Sorts after appends and drops repeated keys (the same list loaded twice,
+ * a host listed twice) in place, so a lookup is one halving over unique keys. */
+static void perm_sort(ipset_perm_t *p) {
+    qsort(p->keys, p->count, sizeof(*p->keys), perm_cmp);
+    size_t n = 0;
+    for (size_t i = 0; i < p->count; i++)
+        if (n == 0 || perm_cmp(&p->keys[n - 1], &p->keys[i]) != 0)
+            p->keys[n++] = p->keys[i];
+    p->count = n;
+    p->sorted = 1;
+}
+
+static int is_permanent(ipset_manager_t *mgr, const char *set_name,
+                        const parsed_cidr_t *entry) {
+    ipset_perm_t *p = &mgr->permanent;
+    ipset_perm_key_t k;
+    if (p->count == 0 || !perm_key(&k, set_name, entry)) return 0;
+    if (!p->sorted) perm_sort(p);
+    return bsearch(&k, p->keys, p->count, sizeof(*p->keys), perm_cmp) != NULL;
 }
 
 int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
@@ -431,13 +498,14 @@ int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
                         new_indices[*new_count] = valid_indices[i];
                         (*new_count)++;
                     } else if (!with_timeout && has_timeout) {
-                        remember_permanent(mgr, set_name_nul, set_name_len, entry);
+                        remember_permanent(mgr, set_name_nul, entry);
                     }
                 } else {
                     int errcode = -err->error;
                     if (errcode == IPSET_ERR_EXIST) {
                         if (has_timeout && with_timeout &&
-                            !is_permanent(mgr, set_name_nul, set_name_len, entry))
+                            !ipset_perm_incomplete(mgr, set_name_nul) &&
+                            !is_permanent(mgr, set_name_nul, entry))
                             refresh[refresh_count++] = i;
                     } else if (errcode == IPSET_ERR_HASH_FULL) {
                         LOG_WARN("ipset '%s' full (maxelem exceeded): set IpsetMaxElem in config", set_name);
