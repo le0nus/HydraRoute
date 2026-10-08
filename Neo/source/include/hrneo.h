@@ -87,6 +87,7 @@ typedef struct {
     int force_interface_count;
     int global_routing;
     int conntrack_flush;
+    int raw_guard;
     int ipset_maxelem;
     char geo_ip_files[MAX_GEO_FILES][MAX_PATH_LEN];
     int geo_ip_file_count;

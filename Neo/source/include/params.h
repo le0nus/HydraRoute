@@ -25,7 +25,7 @@ typedef struct {
     param_type_t   type;
     size_t         cfg_offset;        /* offsetof(config_t, ...) */
     size_t         cfg_count_offset;  /* array count field; 0 if N/A */
-    uint32_t       set_bit;           /* bit in cli_args_t.set_mask */
+    uint64_t       set_bit;           /* bit in cli_args_t.set_mask */
     size_t         buf_size;          /* STRING/PATH buffer size */
     int            default_int;       /* BOOL/INT default */
     const char    *help_arg;          /* "<true|false>", "<path>", … */

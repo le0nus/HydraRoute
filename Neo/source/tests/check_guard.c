@@ -207,10 +207,30 @@ static void check_old_rules_leak(void) {
     assert(p.mark == 0);
 }
 
+/* The rule of a policy target in raw HRNEO_GUARD, in iptables 1.4.21 `-S`
+ * spelling: MARK always prints its mask. */
+static void check_raw_text(void) {
+    char r[GUARD_LINE_MAX];
+    assert(guard_raw_rule(r, sizeof(r), "HydraRoute", M) > 0);
+    assert(strcmp(r, "-A HRNEO_GUARD -m set --match-set HydraRoute dst "
+                     "-j MARK --set-xmark 0xffffaaa/0xffffffff") == 0);
+    assert(guard_raw_rule(r, 16, "HydraRoute", M) == -1);
+
+    /* In the model the raw rule gives an unmarked packet the policy mark. The
+     * cut text "-A HRNEO_GUARD " has no -m or -j: the model finds none. */
+    pkt_t p = {0, 0, 0, 0, 0};
+    eval(r, &p);
+    assert(p.mark == 0);
+    assert(guard_raw_rule(r, sizeof(r), "HydraRoute", M) > 0);
+    eval(r, &p);
+    assert(p.mark == M);
+}
+
 int main(void) {
     check_mangle_text();
     check_invariant();
     check_old_rules_leak();
+    check_raw_text();
     puts("check_guard: OK");
     return 0;
 }

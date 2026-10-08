@@ -16,7 +16,7 @@ typedef struct {
     int keenetic;
     const char *api_command;
     const char *api_arg;
-    uint32_t set_mask;
+    uint64_t set_mask;
     config_t overlay;
 } cli_args_t;
 

@@ -14,6 +14,7 @@
 #include "../include/rci.h"
 #include "../include/conntrack.h"
 #include "../include/geodat.h"
+#include "../include/guard_status.h"
 #include "../include/routing.h"
 #include "../include/nflog_capture.h"
 #include "../include/l7_dispatch.h"
@@ -649,6 +650,7 @@ int main(int argc, char *argv[]) {
 
     LOG_INFO("Packet capture started, waiting for DNS responses...");
 
+    guard_status_init(GUARD_STATUS_PATH);
     commit_start(&signals);
 
     struct epoll_event events[8];

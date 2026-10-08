@@ -31,3 +31,9 @@ int guard_mangle_rule(char *out, size_t size, int k, const char *set,
     }
     return 0;
 }
+
+int guard_raw_rule(char *out, size_t size, const char *set, uint32_t mark) {
+    return fit(snprintf(out, size,
+        "-A " GUARD_CHAIN " -m set --match-set %s dst -j MARK --set-xmark 0x%x/0xffffffff",
+        set, mark), size);
+}

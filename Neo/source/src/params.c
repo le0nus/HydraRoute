@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <errno.h>
 
-#define BIT(n) ((uint32_t)1u << (n))
+#define BIT(n) ((uint64_t)1u << (n))
 
 const param_def_t PARAMS[] = {
     { "autoStart",            "--autoStart",            PT_BOOL,
@@ -85,6 +85,11 @@ const param_def_t PARAMS[] = {
       offsetof(config_t, conntrack_flush),        0,
       BIT(13), 0,            1,
       "<true|false>",            "Flush conntrack on new IP",                  "true"  },
+
+    { "RawGuard",             "--RawGuard",             PT_BOOL,
+      offsetof(config_t, raw_guard),              0,
+      BIT(30), 0,            1,
+      "<true|false>",            "Mark policy traffic in iptables raw (leak guard)", "true"  },
 
     { "IpsetMaxElem",         "--IpsetMaxElem",         PT_INT_POS,
       offsetof(config_t, ipset_maxelem),          0,

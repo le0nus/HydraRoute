@@ -13,6 +13,11 @@ static const char *const OLD_RULES6[] = {
     "-A PREROUTING -m set --match-set HydraRoute6 dst -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff",
 };
 
+/* An unconditional restore hrneo does not own: old hrneo, or a target no
+ * longer in the config. */
+#define OLD_FOREIGN  "-A PREROUTING -m set --match-set Old dst -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff"
+#define OLD_FOREIGN6 "-A PREROUTING -m set --match-set Old6 dst -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff"
+
 /* RU, HydraRoute and the DirectRoute interface target wg0. */
 static void targets_with_wg0(unified_target_t *t3, const unified_target_t *t) {
     memcpy(t3, t, 2 * sizeof(*t));
@@ -29,55 +34,90 @@ static void check_start_and_migration(const unified_target_t *t, config_t *cfg) 
     lines_add(nf[0].mangle, &nf[0].mangle_len, NDM_LINE);
     for (int i = 0; i < 4; i++) lines_add(nf[0].mangle, &nf[0].mangle_len, OLD_RULES[i]);
     for (int i = 0; i < 2; i++) lines_add(nf[1].mangle, &nf[1].mangle_len, OLD_RULES6[i]);
+    /* hrneo 1le2 ran before and was rolled back to 1le1 without raw-off: the
+     * IPv6 chain and its jump are still there, next to the old rules. */
+    nf[1].guard_exists = 1;
+    lines_add(nf[1].guard, &nf[1].guard_len,
+              "-A HRNEO_GUARD -m set --match-set HydraRoute6 dst -j MARK --set-xmark 0xff2/0xffffffff");
+    lines_add(nf[1].raw_pre, &nf[1].raw_pre_len, GUARD_JUMP);
 
-    /* xt_conntrack does not load: nothing is touched, the next commit tries again. */
+    /* xt_conntrack does not load: nothing is touched, the next commit tries
+     * again. The status file still says why the raw guard is not on. */
     reset();
     kmod_result = -1;
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
     assert(kmod_calls == 1 && dumps == 0 && rci_calls == 0);
     assert(restores[0][0] == 0 && restores[1][0] == 0);
+    assert(raw_kmod_calls[0] == 0 && raw_kmod_calls[1] == 0);
+    assert(warns == 1 && strstr(warn_log, "raw guard degraded: conntrack-module-v4"));
+    assert(status_has("raw_guard=degraded:conntrack-module-v4"));
+    assert(status_has("raw_rules_v4=unknown") && status_has("raw_rules_v6=unknown"));
     kmod_result = 0;
 
     /* RCI down at start: no mark is known; the old rules are kept as written,
-     * only put in PolicyOrder (RU first). */
+     * only put in PolicyOrder (RU first). The raw chain stays out while they
+     * are there, and the status says why. The IPv6 jump next to the old
+     * unconditional restore that mangle could not replace goes (§4.5's one
+     * exception): with it, every new IPv6 connection would leak. */
     reset();
     rci_result = RCI_MARK_TRANSPORT;
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
     assert(kmod_calls == 1);
-    assert(warns == 2);
+    assert(raw_kmod_calls[0] == 1 && raw_kmod_calls[1] == 1);
+    assert(warns == 4);                     /* two policies, the jump removal, the raw guard */
+    assert(strstr(warn_log, "ip6tables: removed the jump to raw HRNEO_GUARD"));
+    assert(strstr(warn_log, "raw guard degraded: no-mark-v4"));
     assert(restores[0][0] == 1 && restores[1][0] == 0);
+    assert(strcmp(calls, "m4 r6 ") == 0);
     assert(nf[0].mangle_len == 5);
     assert(strcmp(nf[0].mangle[1], OLD_RULES[2]) == 0 && strcmp(nf[0].mangle[2], OLD_RULES[3]) == 0);
     assert(strcmp(nf[0].mangle[3], OLD_RULES[0]) == 0 && strcmp(nf[0].mangle[4], OLD_RULES[1]) == 0);
     assert(nf[1].mangle_len == 2);
+    assert(!nf[0].guard_exists);
+    assert(raw_jumps(1) == 0 && nf[1].guard_len == 0);
+    assert(status_has("raw_guard=degraded:no-mark-v4"));
+    assert(status_has("raw_rules_v4=0") && status_has("raw_rules_v6=0"));
 
-    /* Still down: both policies are asked again, the cause is a WARN only once. */
+    /* Still down: both policies are asked again, the cause is a WARN only
+     * once; the raw modules are not loaded again. */
     reset();
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
     assert(kmod_calls == 0 && rci_calls == 2 && warns == 0);
+    assert(raw_kmod_calls[0] == 0 && raw_kmod_calls[1] == 0);
     assert(restores[0][0] == 0 && restores[1][0] == 0);
+    assert(calls[0] == '\0');
 
     /* HydraRoute has no mark (RCI_MARK_ABSENT): its rules leave both
-     * families; RU moves to R0..R3. */
+     * families; RU moves to R0..R3. No unconditional restore is left and every
+     * remaining policy has its mark: the migration from hrneo before 1le2.
+     * Mangle is replaced and read back in both families before the raw chain
+     * goes in (§3.2); the fake asserts no unconditional restore while it marks. */
     reset();
     rci_result = RCI_MARK_OK;
     rci_result_hr = RCI_MARK_ABSENT;
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
-    assert(rci_calls == 2 && warns == 1);
+    assert(rci_calls == 2 && warns == 2);
     assert(strstr(warn_log, "Policy HydraRoute has no mark ID yet"));
+    assert(strstr(warn_log, "raw guard on again (was degraded: no-mark-v4)"));
     assert(restores[0][0] == 1 && restores[1][0] == 1);
+    assert(strcmp(calls, "m4 m6 r4 r6 ") == 0);
     assert(strcmp(nf[0].mangle[0], NDM_LINE) == 0);
     assert_mangle_of(0, 1, 1, 0, 0);
     assert_mangle_of(1, 0, 1, 0, 0);
+    assert_raw_of(0, 1, 0);
+    assert_raw_of(1, 1, 0);
+    assert(status_has("raw_guard=on") && status_has("raw_rules_v4=1") && status_has("raw_rules_v6=1"));
 
     /* The same again: no WARN, nothing to change. */
     reset();
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
     assert(rci_calls == 2 && warns == 0);
     assert(restores[0][0] == 0 && restores[1][0] == 0);
+    assert(calls[0] == '\0');
 
     /* HydraRoute gets its mark, which RCI spells with a leading zero and
-     * capitals; RCI fails for RU, which keeps the rules of its known mark. */
+     * capitals; RCI fails for RU, which keeps the rules of its known mark.
+     * Every mark is known: the chain gets HydraRoute too. */
     reset();
     rci_result_ru = RCI_MARK_TRANSPORT;
     rci_result_hr = RCI_MARK_OK;
@@ -85,17 +125,24 @@ static void check_start_and_migration(const unified_target_t *t, config_t *cfg) 
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
     assert(warns == 1 && strstr(warn_log, "RCI unreachable while reading policy RU"));
     assert(restores[0][0] == 1 && restores[1][0] == 1);
+    assert(strcmp(calls, "m4 m6 r4 r6 ") == 0);
     assert_mangle(0, 1, 0xff2, 0);
     assert_mangle(1, 0, 0xff2, 0);
+    assert_raw(0, 0xff2);
+    assert_raw(1, 0xff2);
 
-    /* Once the policy worked, a new failure is reported again. */
+    /* Once the policy worked, a new failure is reported again; its rules
+     * leave mangle and the chain. */
     reset();
     rci_result_hr = RCI_MARK_ABSENT;
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
     assert(warns == 1 && strstr(warn_log, "Policy HydraRoute has no mark ID yet"));
     assert(restores[0][0] == 1 && restores[1][0] == 1);
+    assert(strcmp(calls, "m4 m6 r4 r6 ") == 0);
     assert_mangle_of(0, 1, 1, 0, 0);
     assert_mangle_of(1, 0, 1, 0, 0);
+    assert_raw_of(0, 1, 0);
+    assert_raw_of(1, 1, 0);
 
     /* RCI answers for both: one replace per family, and the start is over. */
     reset();
@@ -104,9 +151,13 @@ static void check_start_and_migration(const unified_target_t *t, config_t *cfg) 
     mark_hr = "ff2";
     assert(rci_calls == 2 && warns == 0);
     assert(restores[0][0] == 1 && restores[1][0] == 1);
+    assert(strcmp(calls, "m4 m6 r4 r6 ") == 0);
     assert(strcmp(nf[0].mangle[0], NDM_LINE) == 0);
     assert_mangle(0, 1, 0xff2, 0);
     assert_mangle(1, 0, 0xff2, 0);
+    assert_raw(0, 0xff2);
+    assert_raw(1, 0xff2);
+    assert(status_has("raw_guard=on") && status_has("raw_rules_v4=2") && status_has("raw_rules_v6=2"));
 }
 
 static void check_audit(const unified_target_t *t, config_t *cfg) {
@@ -115,12 +166,15 @@ static void check_audit(const unified_target_t *t, config_t *cfg) {
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
     assert(rci_calls == 0 && restores[0][0] == 0 && restores[1][0] == 0);
 
-    /* NDMS rebuilt mangle without hrneo's rules: back from the known marks, no RCI. */
+    /* NDMS rebuilt mangle without hrneo's rules: back from the known marks, no
+     * RCI. NDMS leaves raw alone, and so does hrneo. */
     reset();
     mangle_remove_matching(0, "--match-set ");
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
     assert(rci_calls == 0 && restores[0][0] == 1 && restores[1][0] == 0);
+    assert(strcmp(calls, "m4 ") == 0);
     assert_mangle(0, 1, 0xff2, 0);
+    assert_raw(0, 0xff2);
 
     /* One rule missing. */
     reset();
@@ -129,12 +183,17 @@ static void check_audit(const unified_target_t *t, config_t *cfg) {
     assert(restores[1][0] == 1);
     assert_mangle(1, 0, 0xff2, 0);
 
-    /* A stray old unconditional restore. */
+    /* A stray old unconditional restore next to a working chain: this call
+     * replaces mangle and reads it back clean, so the jump stays and the
+     * guard stays on (correction 1, case b). */
     reset();
     lines_add(nf[0].mangle, &nf[0].mangle_len, OLD_RULES[1]);
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
     assert(restores[0][0] == 1);
+    assert(strcmp(calls, "m4 ") == 0);
     assert_mangle(0, 1, 0xff2, 0);
+    assert_raw(0, 0xff2);
+    assert(status_has("raw_guard=on"));
 
     /* A rule twice: both copies go, one comes back. */
     reset();
@@ -164,8 +223,11 @@ static void check_audit(const unified_target_t *t, config_t *cfg) {
     for (int i = 0; i < 2; i++) lines_add(nf[1].mangle, &nf[1].mangle_len, OLD_RULES6[i]);
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
     assert(rci_calls == 0 && restores[0][0] == 1 && restores[1][0] == 1);
+    assert(strcmp(calls, "m4 m6 ") == 0);
     assert_mangle(0, 1, 0xff2, 0);
     assert_mangle(1, 0, 0xff2, 0);
+    assert_raw(0, 0xff2);
+    assert_raw(1, 0xff2);
 
     /* GlobalRouting=true drops the NDMS mark condition from R1. */
     reset();
@@ -187,9 +249,12 @@ static void check_failures(const unified_target_t *t, config_t *cfg) {
     mangle_remove_matching(0, "--match-set RU dst ");
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
     assert(strstr(warn_log, "iptables-restore failed (exit 1): iptables-restore: line 3 failed"));
+    assert(status_has("raw_guard=degraded:restore-v4"));
+    assert_raw(0, 0xff2);                   /* a working chain is kept */
     restore_error = NULL;
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
     assert_mangle(0, 1, 0xff2, 0);
+    assert(status_has("raw_guard=on"));
 
     /* iptables -S fails or is truncated: nothing is written to that family,
      * and "no dump" is not taken for "no rules"; the other family is still
@@ -204,9 +269,11 @@ static void check_failures(const unified_target_t *t, config_t *cfg) {
     assert(strstr(warn_log, "iptables -t mangle -S PREROUTING failed or output truncated"));
     assert(mangle_count(0, "--match-set RU dst ") == 0);
     assert_mangle(1, 0, 0xff2, 0);
+    assert(status_has("raw_guard=degraded:dump-v4"));
     dump_fail[0] = 0;
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
     assert_mangle(0, 1, 0xff2, 0);
+    assert(status_has("raw_guard=on"));
 
     /* IPv4 goes in, ip6tables-restore fails: the commit fails, and the next
      * one replaces IPv6 only. */
@@ -217,8 +284,10 @@ static void check_failures(const unified_target_t *t, config_t *cfg) {
     restore_error_family = 1;
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
     assert(restores[0][0] == 1 && restores[1][0] == 1);
-    assert(warns == 1);
+    assert(warns == 2);                     /* the restore, the raw guard */
     assert(strstr(warn_log, "ip6tables-restore failed (exit 1): ip6tables-restore: line 2 failed"));
+    assert(strstr(warn_log, "raw guard degraded: restore-v6"));
+    assert(strcmp(calls, "m4 m6 ") == 0);
     assert_mangle(0, 1, 0xff2, 0);
     assert(mangle_count(1, "--match-set HydraRoute6 dst ") == 0);
     restore_error = NULL;
@@ -235,7 +304,8 @@ static void check_failures(const unified_target_t *t, config_t *cfg) {
     mangle_remove_matching(0, "--match-set ");
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
-    assert(warns == 1);
+    assert(warns == 2);                     /* the read-back, the raw guard */
+    assert(status_has("raw_guard=degraded:audit-v4"));
     assert(strstr(warn_log, "iptables: mangle PREROUTING differs after replace: expected '-A PREROUTING -m mark --mark 0xff1 "));
     assert(strstr(warn_log, "found '-A PREROUTING -m mark --mark 0xff1 -m conntrack --ctdir ORIGINAL -m connmark --mark 0x0/0xffffffff "));
     echo_full_mask = 0;
@@ -279,6 +349,281 @@ static void check_l7(const unified_target_t *t, const config_t *cfg) {
     assert(nf[1].fwd_len == 2 && nf[1].out_len == 2);
 }
 
+/* The raw chain HRNEO_GUARD (§3.1, §4): audited exactly on every commit,
+ * replaced in one iptables-restore, and only after this call left mangle
+ * known-good in both families. */
+static void check_raw(const unified_target_t *t, config_t *cfg) {
+    /* Chain flushed by someone and a second jump: one raw restore fixes both. */
+    reset();
+    nf[0].guard_len = 0;
+    lines_add(nf[0].raw_pre, &nf[0].raw_pre_len, GUARD_JUMP);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r4 ") == 0);
+    assert_raw(0, 0xff2);
+
+    /* Jump gone, a foreign raw rule there: the jump comes back first. */
+    reset();
+    lines_remove(nf[1].raw_pre, &nf[1].raw_pre_len, 0);
+    lines_add(nf[1].raw_pre, &nf[1].raw_pre_len, FOREIGN_RAW);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r6 ") == 0);
+    assert_raw(1, 0xff2);
+    assert(nf[1].raw_pre_len == 2 && strcmp(nf[1].raw_pre[1], FOREIGN_RAW) == 0);
+
+    /* One jump, but behind a foreign rule: a packet that rule accepts never
+     * reaches the chain. The jump moves to the front. */
+    reset();
+    lines_insert0(nf[0].raw_pre, &nf[0].raw_pre_len, FOREIGN_RAW);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r4 ") == 0);
+    assert_raw(0, 0xff2);
+    assert(nf[0].raw_pre_len == 2 && strcmp(nf[0].raw_pre[1], FOREIGN_RAW) == 0);
+
+    /* Two jumps with foreign rules around and between them, neither first:
+     * every own jump goes and one comes back first, in the same restore. */
+    reset();
+    lines_remove(nf[0].raw_pre, &nf[0].raw_pre_len, 0);
+    lines_add(nf[0].raw_pre, &nf[0].raw_pre_len, GUARD_JUMP);
+    lines_add(nf[0].raw_pre, &nf[0].raw_pre_len, FOREIGN_RAW2);
+    lines_add(nf[0].raw_pre, &nf[0].raw_pre_len, GUARD_JUMP);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r4 ") == 0);
+    assert_raw(0, 0xff2);
+    assert(nf[0].raw_pre_len == 3);
+    assert(strcmp(nf[0].raw_pre[1], FOREIGN_RAW) == 0 && strcmp(nf[0].raw_pre[2], FOREIGN_RAW2) == 0);
+
+    /* A stale rule (another mark) in the chain is replaced. */
+    reset();
+    snprintf(nf[0].guard[0], LINE_LEN,
+             "-A HRNEO_GUARD -m set --match-set HydraRoute dst -j MARK --set-xmark 0xff9/0xffffffff");
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r4 ") == 0);
+    assert_raw(0, 0xff2);
+
+    /* A rule too many (a target no longer in the config) goes. */
+    reset();
+    lines_add(nf[1].guard, &nf[1].guard_len,
+              "-A HRNEO_GUARD -m set --match-set Old6 dst -j MARK --set-xmark 0xff9/0xffffffff");
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r6 ") == 0);
+    assert_raw(1, 0xff2);
+
+    /* Raw missing while the mangle replace fails: raw stays out and the
+     * status names the cause; once mangle is confirmed, raw follows in the
+     * same call. */
+    reset();
+    raw_clear(0);
+    mangle_remove_matching(0, "--match-set ");
+    restore_error = "iptables-restore: line 2 failed";
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    restore_error = NULL;
+    assert(strcmp(calls, "m4 ") == 0);
+    assert(!nf[0].guard_exists);
+    assert(status_has("raw_guard=degraded:restore-v4") && status_has("raw_rules_v4=0"));
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "m4 r4 ") == 0);
+    assert_raw(0, 0xff2);
+    assert(status_has("raw_guard=on"));
+
+    /* IPv4 raw is missing and IPv4 mangle is fine, but the IPv6 replace
+     * fails: raw goes in only once the whole mangle update went through,
+     * both families. The IPv6 chain in place stays. */
+    reset();
+    raw_clear(0);
+    mangle_remove_matching(1, "--match-set ");
+    restore_error = "ip6tables-restore: line 2 failed";
+    restore_error_family = 1;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    restore_error = NULL;
+    restore_error_family = -1;
+    assert(strcmp(calls, "m6 ") == 0);
+    assert(!nf[0].guard_exists);
+    assert_raw(1, 0xff2);
+    assert(status_has("raw_guard=degraded:restore-v6"));
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "m6 r4 ") == 0);
+    assert_mangle(1, 0, 0xff2, 0);
+    assert_raw(0, 0xff2);
+    assert(status_has("raw_guard=on"));
+
+    /* Correction 1, case a: a working chain, an old unconditional restore of a
+     * target back in mangle, and the mangle replace fails. Old R1 skips the
+     * raw mark and old R2 writes connmark 0 over it on every new connection:
+     * worse than no chain. The jump goes (the chain is emptied) in this call,
+     * the one case hrneo takes raw down (§4.5); IPv6 is not touched. */
+    reset();
+    lines_add(nf[0].mangle, &nf[0].mangle_len, OLD_RULES[1]);
+    restore_error = "iptables-restore: line 2 failed";
+    restore_error_table = 0;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    restore_error = NULL;
+    restore_error_table = -1;
+    assert(strcmp(calls, "m4 r4 ") == 0);
+    assert(raw_jumps(0) == 0 && nf[0].guard_len == 0);
+    assert(strstr(warn_log, "iptables: removed the jump to raw HRNEO_GUARD"));
+    assert(status_has("raw_guard=degraded:old-restore-v4") && status_has("raw_rules_v4=0"));
+    assert_raw(1, 0xff2);
+    /* The replace goes through: mangle first, then the chain again. */
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "m4 r4 ") == 0);
+    assert_mangle(0, 1, 0xff2, 0);
+    assert_raw(0, 0xff2);
+    assert(status_has("raw_guard=on") && status_has("raw_rules_v4=2"));
+
+    /* The same, and the raw restore that would take the jump out fails too:
+     * the call fails and is retried; the retry fixes mangle, so the chain
+     * that is still there stays. */
+    reset();
+    lines_add(nf[0].mangle, &nf[0].mangle_len, OLD_RULES[1]);
+    restore_error = "iptables-restore: line 2 failed";
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    restore_error = NULL;
+    assert(strcmp(calls, "m4 r4 ") == 0);
+    assert(raw_jumps(0) == 1);
+    assert(status_has("raw_guard=degraded:old-restore-v4"));
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "m4 ") == 0);
+    assert_mangle(0, 1, 0xff2, 0);
+    assert_raw(0, 0xff2);
+    assert(status_has("raw_guard=on"));
+
+    /* An unconditional restore hrneo does not own: mangle cannot fix it, so
+     * the jump goes and raw stays out, without retries or more log lines,
+     * until the rule is gone. */
+    reset();
+    lines_add(nf[0].mangle, &nf[0].mangle_len, OLD_FOREIGN);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r4 ") == 0);
+    assert(raw_jumps(0) == 0 && nf[0].guard_len == 0);
+    assert(warns == 2);                     /* the removal, the raw guard */
+    assert(status_has("raw_guard=degraded:old-restore-v4"));
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(calls[0] == '\0' && warns == 0);
+    mangle_remove_matching(0, "--match-set Old dst ");
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r4 ") == 0);
+    assert_raw(0, 0xff2);
+    assert(status_has("raw_guard=on"));
+
+    /* Any unconditional restore left in mangle keeps raw from going in, in
+     * either family: IPv6 has one, IPv4 raw is missing and stays out. */
+    reset();
+    raw_clear(0);
+    lines_add(nf[1].mangle, &nf[1].mangle_len, OLD_FOREIGN6);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r6 ") == 0);
+    assert(!nf[0].guard_exists);
+    assert(raw_jumps(1) == 0 && nf[1].guard_len == 0);
+    assert(status_has("raw_guard=degraded:old-restore-v6"));
+    mangle_remove_matching(1, "--match-set Old6 dst ");
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r4 r6 ") == 0);
+    assert_raw(0, 0xff2);
+    assert_raw(1, 0xff2);
+    assert(status_has("raw_guard=on"));
+
+    /* The raw restore fails: the status names it, and the call is retried. */
+    reset();
+    nf[0].guard_len = 0;
+    restore_error = "iptables-restore: line 3 failed";
+    restore_error_table = 1;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    restore_error = NULL;
+    restore_error_table = -1;
+    assert(strcmp(calls, "r4 ") == 0);
+    assert(nf[0].guard_len == 0);
+    assert(strstr(warn_log, "iptables-restore failed (exit 1): iptables-restore: line 3 failed"));
+    assert(status_has("raw_guard=degraded:restore-v4"));
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r4 ") == 0);
+    assert_raw(0, 0xff2);
+    assert(status_has("raw_guard=on"));
+
+    /* The chain reads back in another spelling: one WARN naming both lines,
+     * the call fails and is retried, no WARN per retry. */
+    reset();
+    raw_echo_other = 1;
+    nf[0].guard_len = 0;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    assert(strcmp(calls, "r4 r4 ") == 0);
+    assert(warns == 2);                     /* the read-back, the raw guard */
+    assert(strstr(warn_log, "iptables: raw HRNEO_GUARD differs after replace"));
+    assert(strstr(warn_log, "expected '-A HRNEO_GUARD -m set --match-set HydraRoute dst -j MARK --set-xmark 0xff2/0xffffffff'"));
+    assert(strstr(warn_log, "found '-A HRNEO_GUARD -m set --match-set HydraRoute dst -j MARK --set-xmark 0xff2'"));
+    assert(status_has("raw_guard=degraded:audit-v4") && status_has("raw_rules_v4=2"));
+    raw_echo_other = 0;
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r4 ") == 0);
+    assert_raw(0, 0xff2);
+    assert(status_has("raw_guard=on"));
+
+    /* The raw dump fails or is cut short: nothing is written to raw, "no
+     * dump" is not taken for "no chain", and the count is unknown, not 0. */
+    reset();
+    raw_dump_fail[0] = 1;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    assert(calls[0] == '\0');
+    assert(warns == 2);                     /* the dump once, the raw guard */
+    assert(strstr(warn_log, "iptables -t raw -S failed or output truncated"));
+    assert(status_has("raw_guard=degraded:audit-v4"));
+    assert(status_has("raw_rules_v4=unknown") && status_has("raw_rules_v6=2"));
+    raw_dump_fail[0] = 0;
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(calls[0] == '\0');
+    assert(status_has("raw_guard=on") && status_has("raw_rules_v4=2"));
+
+    /* Only IPv6 fails: IPv4 is put right in the same call, the next call
+     * puts IPv6 right. */
+    reset();
+    nf[0].guard_len = 0;
+    nf[1].guard_len = 0;
+    restore_error = "ip6tables-restore: line 2 failed";
+    restore_error_family = 1;
+    restore_error_table = 1;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    restore_error = NULL;
+    restore_error_family = restore_error_table = -1;
+    assert(strcmp(calls, "r4 r6 ") == 0);
+    assert_raw(0, 0xff2);
+    assert(nf[1].guard_len == 0);
+    assert(status_has("raw_guard=degraded:restore-v6") && status_has("raw_rules_v6=0"));
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r6 ") == 0);
+    assert_raw(1, 0xff2);
+    assert(strstr(warn_log, "raw guard on again (was degraded: restore-v6)"));
+
+    /* RawGuard=false: raw is not read or written and the status says off. In
+     * this version the chain in place is left alone (raw-off is Task 4). */
+    reset();
+    cfg->raw_guard = 0;
+    raw_clear(0);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(calls[0] == '\0' && dumps == 2);
+    assert(!nf[0].guard_exists);
+    assert_raw(1, 0xff2);
+    assert(status_has("raw_guard=off"));
+    assert(status_has("raw_rules_v4=unknown") && status_has("raw_rules_v6=unknown"));
+    cfg->raw_guard = 1;
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(strcmp(calls, "r4 ") == 0);
+    assert_raw(0, 0xff2);
+    assert(status_has("raw_guard=on"));
+}
+
 /* A DirectRoute interface target: its mark is its fwmark (no RCI), it has no
  * raw mark and so no R0; the stop removes its R1..R3 with the rest. */
 static void check_interface_target(const unified_target_t *t, const config_t *cfg) {
@@ -289,6 +634,9 @@ static void check_interface_target(const unified_target_t *t, const config_t *cf
     assert(apply_unified_connmark_rules(t3, 3, cfg, NULL) == 0);
     assert(rci_calls == 0);
     assert(restores[0][0] == 1 && restores[1][0] == 1);
+    assert(strcmp(calls, "m4 m6 ") == 0);   /* not marked early: raw is unchanged */
+    assert_raw(0, 0xff2);
+    assert_raw(1, 0xff2);
     for (int fi = 0; fi < 2; fi++) {
         const char *set = fi ? t3[2].pair.ipv6 : t3[2].pair.ipv4;
         int pos = expect_mangle_rules(fi, fi ? 0 : 1, 3, 0xff2, 0);
@@ -311,6 +659,8 @@ static void check_interface_target(const unified_target_t *t, const config_t *cf
     assert(restores[0][0] == 1 && restores[1][0] == 1);
     assert(nf[0].mangle_len == 1 && strcmp(nf[0].mangle[0], NDM_LINE) == 0);
     assert(nf[1].mangle_len == 0);
+    assert_raw(0, 0xff2);                   /* the stop leaves raw in place (§4.5) */
+    assert_raw(1, 0xff2);
 }
 
 /* More rules than one batch holds: the replace is never split into several
@@ -333,6 +683,10 @@ static void check_overflow(const unified_target_t *t, const config_t *cfg) {
     reset();
     assert(apply_unified_connmark_rules(big, MAX_TARGETS, cfg, NULL) == -1);
     assert(restores[0][0] == 0 && restores[1][0] == 0);
+    assert(calls[0] == '\0');               /* raw neither: mangle is not confirmed */
+    assert(status_has("raw_guard=degraded:batch-overflow-v4"));
+    assert_raw(0, 0xff2);
+    assert_raw(1, 0xff2);
     assert(errors == 2);
     p = strstr(error_log, "mangle batch overflow (");
     assert(p && sscanf(p, "mangle batch overflow (%zu bytes needed, %zu available)", &need, &avail) == 2);
@@ -378,10 +732,14 @@ int main(void) {
     config_t cfg;
     unified_target_t t[2];
     setup_targets(t, &cfg);
+    cfg.raw_guard = 1;
+    remove(STATUS_PATH);
+    guard_status_init(STATUS_PATH);
     check_start_and_migration(t, &cfg);
     check_audit(t, &cfg);
     check_failures(t, &cfg);
     check_l7(t, &cfg);
+    check_raw(t, &cfg);
     check_interface_target(t, &cfg);
     check_overflow(t, &cfg);
     check_cleanup(t, &cfg);

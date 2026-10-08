@@ -31,4 +31,9 @@
 int guard_mangle_rule(char *out, size_t size, int k, const char *set,
                       uint32_t mark, int is_interface, int global_routing);
 
+/* The rule of a policy target in raw HRNEO_GUARD: every packet to an address
+ * of the target's set gets the policy mark before conntrack sees it. MARK
+ * prints its mask even when full. Same return values as guard_mangle_rule. */
+int guard_raw_rule(char *out, size_t size, const char *set, uint32_t mark);
+
 #endif

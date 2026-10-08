@@ -5,6 +5,7 @@
 
 #include "../include/iptables.h"
 #include "../include/guard.h"
+#include "../include/guard_status.h"
 #include "../include/util.h"
 #include <assert.h>
 #include <stdarg.h>
@@ -15,6 +16,12 @@
 #define MAX_LINES 64
 #define LINE_LEN  320
 #define NDM_LINE  "-A PREROUTING -j _NDM_HOTSPOT_PREROUTING_MANGL"
+#define FOREIGN_RAW  "-A PREROUTING -p udp -m udp --dport 9 -j CT --notrack"
+#define FOREIGN_RAW2 "-A PREROUTING -i br0 -p tcp -m tcp --dport 7 -j CT --notrack"
+
+#ifndef STATUS_PATH
+#define STATUS_PATH "build/check_connmark.status"
+#endif
 
 /* One family: mangle PREROUTING, FORWARD, OUTPUT and the raw table. */
 typedef struct {
@@ -40,8 +47,12 @@ static int  rci_result_ru = RCI_MARK_OK, rci_result_hr = RCI_MARK_OK;   /* ... u
 static const char *mark_ru = "ff1", *mark_hr = "ff2";
 static const char *restore_error;
 static int  restore_error_family = -1; /* family restore_error applies to, -1: both */
-static int  dump_fail[2];              /* iptables -S fails or is truncated */
-static int  kmod_result;
+static int  restore_error_table = -1;  /* table restore_error applies to: 0 mangle, 1 raw, -1 both */
+static int  dump_fail[2];              /* iptables -t mangle -S fails or is truncated */
+static int  raw_dump_fail[2];          /* iptables -t raw -S fails (no table) or is truncated */
+static int  raw_echo_other;            /* fake an iptables that prints the MARK target otherwise */
+static int  kmod_result;               /* xt_conntrack */
+static int  raw_kmod_fail[2], raw_kmod_calls[2];   /* iptable_raw, ip6table_raw */
 static char warn_log[4096], error_log[1024];
 static int  echo_full_mask;            /* fake an iptables that prints "--mark 0x0/0xffffffff" */
 
@@ -94,13 +105,15 @@ static inline int mangle_count(int fi, const char *needle) {
 }
 
 int __wrap_run_command_output(const char *cmd, char *const argv[], char *output, size_t size) {
-    fake_nf_t *f = &nf[family_of(cmd)];
+    int fi = family_of(cmd);
+    fake_nf_t *f = &nf[fi];
+    int raw = strcmp(argv[3], "raw") == 0;
     size_t off = 0;
     dumps++;
     output[0] = '\0';
-    if (dump_fail[family_of(cmd)]) return -1;
+    if (raw ? raw_dump_fail[fi] : dump_fail[fi]) return -1;
 #define OUT(...) (off += (size_t)snprintf(output + off, size - off, __VA_ARGS__))
-    if (strcmp(argv[3], "raw") == 0) {
+    if (raw) {
         OUT("-P PREROUTING ACCEPT\n-P OUTPUT ACCEPT\n");
         if (f->guard_exists) OUT("-N %s\n", GUARD_CHAIN);
         for (int i = 0; i < f->raw_pre_len; i++) OUT("%s\n", f->raw_pre[i]);
@@ -132,6 +145,26 @@ static inline void store(char (*a)[LINE_LEN], int *n, const char *line) {
     lines_add(a, n, buf);
 }
 
+/* A raw rule as this iptables prints it back; raw_echo_other leaves out the
+ * mask, so the read-back differs from what hrneo wrote. */
+static inline void store_raw(fake_nf_t *f, const char *line) {
+    char buf[LINE_LEN];
+    const char *mask = raw_echo_other ? strstr(line, "/0xffffffff") : NULL;
+    if (mask)
+        snprintf(buf, sizeof(buf), "%.*s", (int)(mask - line), line);
+    else
+        snprintf(buf, sizeof(buf), "%s", line);
+    lines_add(f->guard, &f->guard_len, buf);
+}
+
+/* The foreign rules of raw PREROUTING, in order. */
+static inline void raw_foreign(const fake_nf_t *f, char *out, size_t size) {
+    out[0] = '\0';
+    for (int i = 0; i < f->raw_pre_len; i++)
+        if (strcmp(f->raw_pre[i], GUARD_JUMP) != 0)
+            snprintf(out + strlen(out), size - strlen(out), "%s\n", f->raw_pre[i]);
+}
+
 /* §3.2: while raw marks packets, no unconditional --restore-mark may be left
  * in mangle, or it writes connmark 0 over the raw mark of every new connection. */
 static inline void assert_no_unconditional_restore(int fi) {
@@ -151,10 +184,18 @@ static inline int mangle_chain(fake_nf_t *f, const char *chain, char (**a)[LINE_
 int __wrap_run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t len,
                              char *err, size_t err_size) {
     static char buf[IPT_BATCH_SIZE];
+    static char foreign_before[MAX_LINES * LINE_LEN], foreign_after[MAX_LINES * LINE_LEN];
     int fi = family_of(cmd);
     fake_nf_t *f = &nf[fi];
     int table = strncmp(input, "*raw\n", 5) == 0;
-    int fail = restore_error && (restore_error_family < 0 || restore_error_family == fi);
+    int fail = restore_error && (restore_error_family < 0 || restore_error_family == fi) &&
+               (restore_error_table < 0 || restore_error_table == table);
+    /* One table, one transaction: --noflush keeps what the batch does not name,
+     * and nothing is applied without the final COMMIT. */
+    assert(argv[1] && strcmp(argv[1], "--noflush") == 0 && !argv[2]);
+    assert(table || strncmp(input, "*mangle\n", 8) == 0);
+    assert(len >= 8 && memcmp(input + len - 8, "\nCOMMIT\n", 8) == 0);
+    for (size_t i = 0; i + 7 < len; i++) assert(memcmp(input + i, "COMMIT", 6) != 0);
     restores[fi][table]++;
     snprintf(calls + strlen(calls), sizeof(calls) - strlen(calls), "%c%d ", table ? 'r' : 'm', fi ? 6 : 4);
     snprintf(err, err_size, "%s", fail ? restore_error : "");
@@ -163,6 +204,7 @@ int __wrap_run_command_stdin(const char *cmd, char *const argv[], const char *in
     assert(len < sizeof(buf));
     memcpy(buf, input, len);
     buf[len] = '\0';
+    raw_foreign(f, foreign_before, sizeof(foreign_before));
     char *save;
     for (char *line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
         char chain[16] = "";
@@ -180,7 +222,7 @@ int __wrap_run_command_stdin(const char *cmd, char *const argv[], const char *in
             f->guard_len = 0;
         } else if (strncmp(line, "-A " GUARD_CHAIN " ", strlen("-A " GUARD_CHAIN " ")) == 0) {
             assert(table && f->guard_exists);
-            lines_add(f->guard, &f->guard_len, line);
+            store_raw(f, line);
         } else if (strncmp(line, "-A PREROUTING ", 14) == 0 && table) {
             lines_add(f->raw_pre, &f->raw_pre_len, line);
         } else if (line[1] == 'A' && !table && mangle_chain(f, chain, &a, &n)) {
@@ -212,6 +254,8 @@ int __wrap_run_command_stdin(const char *cmd, char *const argv[], const char *in
             assert(0);
         }
     }
+    raw_foreign(f, foreign_after, sizeof(foreign_after));
+    assert(strcmp(foreign_before, foreign_after) == 0);     /* foreign raw rules stay, in order */
     if (f->guard_len > 0) assert_no_unconditional_restore(fi);
     return 0;
 }
@@ -233,10 +277,19 @@ void __wrap_log_write(const char *fmt, ...) {
     }
 }
 
+/* xt_conntrack, and the raw table modules of each family. A raw module that
+ * fails logs its WARN, as the real loader does. */
 int __wrap_l7_firewall_load_kmod_if_present(const char *name) {
-    assert(strcmp(name, "xt_conntrack") == 0);
-    kmod_calls++;
-    return kmod_result;
+    if (strcmp(name, "xt_conntrack") == 0) {
+        kmod_calls++;
+        return kmod_result;
+    }
+    int fi = strcmp(name, "ip6table_raw") == 0;
+    assert(fi || strcmp(name, "iptable_raw") == 0);
+    raw_kmod_calls[fi]++;
+    if (!raw_kmod_fail[fi]) return 0;
+    __wrap_log_write("[WARN] kmod %s: init_module failed: %s\n", name, "Exec format error");
+    return -1;
 }
 
 int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
@@ -254,6 +307,7 @@ static inline void reset(void) {
     warn_log[0] = '\0';
     error_log[0] = '\0';
     dumps = rci_calls = warns = errors = kmod_calls = 0;
+    raw_kmod_calls[0] = raw_kmod_calls[1] = 0;
 }
 
 static inline void setup_targets(unified_target_t *t, config_t *cfg) {
@@ -295,6 +349,60 @@ static inline void assert_mangle_of(int fi, int base, unsigned mask, uint32_t hr
 /* Both targets, RU then HydraRoute. */
 static inline void assert_mangle(int fi, int base, uint32_t hr_mark, int global_routing) {
     assert_mangle_of(fi, base, 3, hr_mark, global_routing);
+}
+
+/* The status file has this exact line. */
+static inline int status_has(const char *line) {
+    char buf[1024], want[128];
+    FILE *f = fopen(STATUS_PATH, "r");
+    if (!f) return 0;
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    snprintf(want, sizeof(want), "%s\n", line);
+    for (const char *p = buf; (p = strstr(p, want)); p++)
+        if (p == buf || p[-1] == '\n') return 1;
+    return 0;
+}
+
+static inline int raw_jumps(int fi) {
+    return lines_count(nf[fi].raw_pre, nf[fi].raw_pre_len, GUARD_JUMP);
+}
+
+/* neo raw-off by hand: chain and jumps gone. */
+static inline void raw_clear(int fi) {
+    nf[fi].guard_exists = 0;
+    nf[fi].guard_len = 0;
+    for (int i = 0; i < nf[fi].raw_pre_len; i++)
+        if (strcmp(nf[fi].raw_pre[i], GUARD_JUMP) == 0)
+            lines_remove(nf[fi].raw_pre, &nf[fi].raw_pre_len, i--);
+}
+
+/* raw of family fi: one jump, first in PREROUTING, and in the chain the rules
+ * of the targets in mask (bit 0 RU 0xff1, bit 1 HydraRoute hr_mark) in reverse
+ * PolicyOrder: HydraRoute, then RU, so the last match, RU, sets the mark. */
+static inline void assert_raw_of(int fi, unsigned mask, uint32_t hr_mark) {
+    uint32_t marks[2] = {0xff1, hr_mark};
+    int pos = 0;
+    assert(nf[fi].guard_exists);
+    assert(nf[fi].raw_pre_len >= 1 && strcmp(nf[fi].raw_pre[0], GUARD_JUMP) == 0);
+    assert(raw_jumps(fi) == 1);
+    for (int i = 1; i >= 0; i--) {
+        char want[GUARD_LINE_MAX];
+        if (!(mask & (1u << i))) continue;
+        assert(guard_raw_rule(want, sizeof(want), SETS[fi][i], marks[i]) > 0);
+        if (pos >= nf[fi].guard_len || strcmp(nf[fi].guard[pos], want) != 0) {
+            fprintf(stderr, "family %d raw rule %d: want '%s'\n  got '%s'\n", fi, pos, want,
+                    pos < nf[fi].guard_len ? nf[fi].guard[pos] : "(none)");
+            assert(0);
+        }
+        pos++;
+    }
+    assert(nf[fi].guard_len == pos);
+}
+
+static inline void assert_raw(int fi, uint32_t hr_mark) {
+    assert_raw_of(fi, 3, hr_mark);
 }
 
 #endif
