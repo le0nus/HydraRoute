@@ -148,6 +148,55 @@ static void first_dump_unknown(int fi) {
     assert(status_has(fi ? "raw_guard=degraded:dump-v6" : "raw_guard=degraded:dump-v4"));
 }
 
+/* The raw module of family fi fails to load; it is not tried again. The
+ * table is absent at first: the read fails and the kernel does not list raw.
+ * Then another process loads it: the next commit reads it and puts the
+ * chain in, with no second load attempt (Codex re-review r2). */
+static void loader_fails_then_table(int fi) {
+    raw_kmod_fail[fi] = 1;
+    raw_dump_fail[fi] = 1;
+    raw_listed[fi] = 0;
+    reset();
+    assert(apply() == 0);
+    assert(strcmp(calls, fi ? "m4 m6 r4 " : "m4 m6 r6 ") == 0);
+    assert(raw_kmod_calls[fi] == 1 && proc_calls == 1);
+    assert(strstr(warn_log, fi ? "kmod ip6table_raw: init_module failed" : "kmod iptable_raw: init_module failed"));
+    assert(status_has(fi ? "raw_guard=degraded:raw-modules-v6" : "raw_guard=degraded:raw-modules-v4"));
+    raw_dump_fail[fi] = 0;
+    raw_listed[fi] = 1;
+    reset();
+    assert(apply() == 0);
+    assert(strcmp(calls, fi ? "r6 " : "r4 ") == 0);
+    assert(raw_kmod_calls[0] == 0 && raw_kmod_calls[1] == 0);
+    assert_raw(0, 0xff2);
+    assert_raw(1, 0xff2);
+    assert(status_has("raw_guard=on"));
+}
+
+/* The raw module of family fi fails to load, yet its table is there with a
+ * jump (loaded by someone else; 1le2 rolled back without raw-off), and that
+ * family's mangle has an unconditional restore hrneo cannot replace: the
+ * jump still goes (Ruling 29). */
+static void loader_fails_old_restore(int fi) {
+    raw_kmod_fail[fi] = 1;
+    nf[fi].guard_exists = 1;
+    lines_add(nf[fi].guard, &nf[fi].guard_len, fi ? "-A HRNEO_GUARD -m set --match-set HydraRoute6 dst -j MARK --set-xmark 0xff2/0xffffffff"
+                                                 : "-A HRNEO_GUARD -m set --match-set HydraRoute dst -j MARK --set-xmark 0xff2/0xffffffff");
+    lines_add(nf[fi].raw_pre, &nf[fi].raw_pre_len, GUARD_JUMP);
+    lines_add(nf[fi].mangle, &nf[fi].mangle_len,
+              fi ? "-A PREROUTING -m set --match-set Old6 dst -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff"
+                 : "-A PREROUTING -m set --match-set Old dst -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff");
+    reset();
+    assert(apply() == 0);
+    assert(strcmp(calls, fi ? "m4 m6 r6 " : "m4 m6 r4 ") == 0);
+    assert(raw_kmod_calls[fi] == 1);
+    assert(raw_jumps(fi) == 0 && nf[fi].guard_len == 0);
+    assert(!nf[!fi].guard_exists);          /* the restore keeps raw out of both */
+    assert(strstr(warn_log, fi ? "ip6tables: removed the jump to raw HRNEO_GUARD"
+                               : "iptables: removed the jump to raw HRNEO_GUARD"));
+    assert(status_has(fi ? "raw_guard=degraded:old-restore-v6" : "raw_guard=degraded:old-restore-v4"));
+}
+
 int main(void) {
     run("confirm_fails", confirm_fails, 0);
     run("confirm_fails", confirm_fails, 1);
@@ -157,6 +206,10 @@ int main(void) {
     run("first_dump_absent", first_dump_absent, 2);
     run("first_dump_unknown", first_dump_unknown, 0);
     run("first_dump_unknown", first_dump_unknown, 1);
+    run("loader_fails_then_table", loader_fails_then_table, 0);
+    run("loader_fails_then_table", loader_fails_then_table, 1);
+    run("loader_fails_old_restore", loader_fails_old_restore, 0);
+    run("loader_fails_old_restore", loader_fails_old_restore, 1);
     puts("check_raw_start: OK");
     return 0;
 }

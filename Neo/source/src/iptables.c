@@ -55,7 +55,7 @@ typedef struct {
     int  unsafe;            /* the latest PREROUTING read of this call holds an
                              * unconditional restore (unsafe_restore); a failed read
                              * keeps what an earlier one in the call found */
-    int  raw_kmod;          /* raw table module: 0 not tried, 1 loaded or no .ko, -1 load failed */
+    int  raw_kmod_tried;    /* loading the raw table module was tried, whatever came of it */
     int  warned_raw_dump, warned_raw;
 } connmark_family_t;
 
@@ -671,14 +671,12 @@ static int commit_raw(connmark_family_t *fam, const unified_target_t *targets, i
     const char *mangle_reason = r->reason;
     raw_view_t v;
 
-    /* Loaded once per process. No .ko is not a failure: the table may be
-     * built into the kernel, and reading it decides. */
-    if (!fam->raw_kmod)
-        fam->raw_kmod = l7_firewall_load_kmod_if_present(fi ? "ip6table_raw" : "iptable_raw") == 0
-                        ? 1 : -1;
-    if (fam->raw_kmod < 0) {
-        r->reason = "raw-modules";
-        return 0;
+    /* Loaded once per process (the loader logs a failure). Its result does
+     * not decide: the table may be built in, or loaded later by someone
+     * else, so it is read on every commit (Codex re-review r2). */
+    if (!fam->raw_kmod_tried) {
+        fam->raw_kmod_tried = 1;
+        l7_firewall_load_kmod_if_present(fi ? "ip6table_raw" : "iptable_raw");
     }
     if (dump_raw(fam) != 0) {
         /* Absent only on evidence (Ruling 30). The failed read asked the
