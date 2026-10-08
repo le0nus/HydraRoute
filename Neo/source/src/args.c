@@ -38,7 +38,9 @@ static void print_help(void) {
     printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--raw-off",
            "Remove the raw guard chain (HRNEO_GUARD) and exit");
     printf("  %-*s    %s\n", HELP_FLAG_WIDTH, "",
-           "hrneo must be stopped (exit code 2 if it runs);");
+           "hrneo must be stopped (exit code 2 if it runs; 1 not fully");
+    printf("  %-*s    %s\n", HELP_FLAG_WIDTH, "",
+           "removed; 3 removed, status file not saved);");
     printf("  %-*s    %s\n", HELP_FLAG_WIDTH, "",
            "its next start with RawGuard=true puts the chain back");
     printf("  %-*s  %s\n", HELP_FLAG_WIDTH, "--version, -v", "Print version and exit");

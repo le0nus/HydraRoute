@@ -1,5 +1,6 @@
 #define STATUS_PATH "build/check_raw_start.status"
 #include "fake_nf.h"
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -340,6 +341,44 @@ static void raw_off_restore_fails(int fi) {
 
 /* The restore of family fi says it worked, but the read-back still shows
  * the chain: not removed, exit 1, with a WARN naming what is left. */
+/* The status file cannot be written (a directory sits where its temporary
+ * copy goes): the rules are gone but the stopped daemon's "on" stays, so
+ * the exit code is 3, not 0, and the error says what happened. Run again
+ * once the file can be written, it publishes off. Rules that did not go
+ * win over the status: exit 1. */
+static void raw_off_status_unsaved(int unused) {
+    (void)unused;
+    leftovers();
+    assert(freopen(OUT_PATH, "w", stdout));
+    FILE *f = fopen(STATUS_PATH, "w");
+    assert(f);
+    fputs("raw_guard=on\nraw_rules_v4=1\nraw_rules_v6=1\nlast_rebuild=1\n", f);
+    fclose(f);
+    assert(mkdir(STATUS_PATH ".tmp", 0755) == 0);
+    reset();
+    assert(raw_off_command(LOCK_PATH) == 3);
+    assert(strcmp(calls, "r4 r6 ") == 0 && raw_gone(0) && raw_gone(1));
+    assert(status_has("raw_guard=on"));
+    assert(strstr(warn_log, "cannot write " STATUS_PATH));
+    assert(strstr(error_log, "raw guard chain HRNEO_GUARD removed, but the status file was not saved"));
+    assert(strcmp(printed(), "") == 0);
+    /* Still unwritable, and now a rule removal fails too: that wins. */
+    lines_add(nf[1].raw_pre, &nf[1].raw_pre_len, GUARD_JUMP);
+    nf[1].guard_exists = 1;
+    raw_dump_fail[1] = 1;
+    reset();
+    assert(raw_off_command(LOCK_PATH) == 1);
+    assert(strstr(error_log, "not fully removed"));
+    raw_dump_fail[1] = 0;
+    assert(rmdir(STATUS_PATH ".tmp") == 0);
+    reset();
+    assert(raw_off_command(LOCK_PATH) == 0);
+    assert(raw_gone(0) && !nf[1].guard_exists && raw_jumps(1) == 0);
+    assert(status_has("raw_guard=off"));
+    assert(strstr(printed(), "raw guard chain HRNEO_GUARD removed"));
+    remove(OUT_PATH);
+}
+
 static void raw_off_readback(int fi) {
     leftovers();
     assert(freopen("/dev/null", "w", stdout));
@@ -464,6 +503,7 @@ int main(void) {
     run("raw_off_restore_fails", raw_off_restore_fails, 1);
     run("raw_off_readback", raw_off_readback, 0);
     run("raw_off_readback", raw_off_readback, 1);
+    run("raw_off_status_unsaved", raw_off_status_unsaved, 0);
     run("raw_guard_false_start", raw_guard_false_start, 0);
     run("raw_guard_false_fails", raw_guard_false_fails, 0);
     run("raw_guard_false_fails", raw_guard_false_fails, 1);

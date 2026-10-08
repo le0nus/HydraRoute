@@ -9,11 +9,18 @@ export PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/usr/sbin:/usr/bin:/sb
 # hrneo leaves its raw chain in place on stop, so restarts stay protected;
 # without hrneo nothing maintains it, so it goes with the package. raw-off
 # stops hrneo, waits for it to exit and removes the chain. If any of that
-# fails the package stays, and removing it again tries again.
-if ! /opt/etc/init.d/S99hrneo raw-off; then
-    echo "hrneo: raw guard not removed, package kept; fix the cause and remove it again" >&2
-    exit 1
-fi
+# fails the package stays, and removing it again tries again. Exit 3 means
+# the chain is gone and only hrneo's status file was not saved, which does
+# not matter once the package goes.
+/opt/etc/init.d/S99hrneo raw-off
+case $? in
+    0) ;;
+    3) echo "hrneo: warning: raw guard removed, but its status file was not saved" >&2 ;;
+    *)
+        echo "hrneo: raw guard not removed, package kept; fix the cause and remove it again" >&2
+        exit 1
+        ;;
+esac
 
 # The raw modules go too, but only with a table shown empty: read whole,
 # with no rule, no chain of its own and the built-in policies ACCEPT. A

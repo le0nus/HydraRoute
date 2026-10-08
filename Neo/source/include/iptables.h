@@ -27,8 +27,10 @@ int raw_guard_remove(void);
 int raw_guard_disable(void);
 /* hrneo --raw-off: only while no process holds lock_path, which the daemon
  * holds for its whole life; the result goes to the status file as
- * raw_guard_disable() does. Returns the exit code: 0 gone, 1 not fully
- * removed, 2 hrneo is running (nothing read, changed or written). */
+ * raw_guard_disable() does. Returns the exit code: 0 gone and the status
+ * saved, 1 not fully removed, 2 hrneo is running (nothing read, changed or
+ * written), 3 gone from both families but the status file not saved (a new
+ * run publishes it). */
 int raw_off_command(const char *lock_path);
 void iptables_delete_rules_matching(const char *ipt_cmd, const char *chain,
                                     const char *needle1, const char *needle2);

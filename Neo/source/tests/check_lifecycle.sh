@@ -200,6 +200,14 @@ run 2 "$S99" raw-off
 log_is "rc.func stop caller= ARGS=
 hrneo --raw-off"
 
+scenario raw-off-status-unsaved
+# Exit 3: the rules are gone, the status file was not saved; hrneo said so.
+echo 3 > "$FAKE_ST/hrneo_rc"
+run 3 "$S99" raw-off
+log_is "rc.func stop caller= ARGS=
+hrneo --raw-off"
+out_has "RawGuard=true puts the raw guard back"
+
 scenario ipset-clean
 run 0 "$S99" ipset-clean awg
 log_is "rc.func stop caller=awg ARGS=
@@ -290,6 +298,18 @@ run 1 "$PRERM" remove
 log_is "rc.func stop caller= ARGS=
 hrneo --raw-off"
 out_has "package kept"
+
+scenario prerm-remove-status-unsaved
+# The rules are gone; the status file means nothing once the package goes.
+echo 3 > "$FAKE_ST/hrneo_rc"
+run 0 "$PRERM" remove
+log_is "rc.func stop caller= ARGS=
+hrneo --raw-off
+iptables -w -t raw -S
+rmmod iptable_raw
+ip6tables -w -t raw -S
+rmmod ip6table_raw"
+out_has "warning: raw guard removed, but its status file was not saved"
 
 scenario prerm-remove-again
 echo 0 > "$FAKE_ST/alive"

@@ -37,11 +37,18 @@ case "$1" in
         # Takes the raw guard down, e.g. before installing a version without
         # it. hrneo is stopped first, so nothing puts the chain back; hrneo
         # --raw-off itself refuses (exit 2) while any hrneo holds the lock.
+        # Its exit code goes out as is: 0 removed, 1 not fully removed, 2
+        # hrneo runs again, 3 removed but its status file not saved.
         stop_and_wait "$2" || exit 1
-        hrneo --raw-off || exit $?
-        echo "hrneo stays stopped. Its next start with RawGuard=true puts the raw guard back;"
-        echo "RawGuard=false in /opt/etc/HydraRoute/hrneo.conf keeps it off."
-        exit 0
+        hrneo --raw-off
+        rc=$?
+        case "$rc" in
+            0|3)
+                echo "hrneo stays stopped. Its next start with RawGuard=true puts the raw guard back;"
+                echo "RawGuard=false in /opt/etc/HydraRoute/hrneo.conf keeps it off."
+                ;;
+        esac
+        exit "$rc"
         ;;
     ipset-clean)
         # Starts hrneo again with its sets emptied; the raw chain stays. The

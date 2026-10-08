@@ -864,18 +864,19 @@ static void raw_off_status(void) {
     guard_status_set_raw(RAW_GUARD_DEGRADED, reason, -1, -1);
 }
 
-/* One removal with its result in the status file. */
-static int raw_off_publish(int *removed) {
+/* One removal with its result in the status file. *saved: the file was
+ * written (a status not written stays pending for the next flush). */
+static int raw_off_publish(int *removed, int *saved) {
     int r = raw_off_try(removed);
     raw_off_status();
     if (*removed) guard_status_set_rebuild(time(NULL));
-    guard_status_flush();
+    *saved = guard_status_flush() == 0;
     return r;
 }
 
 int raw_guard_disable(void) {
-    int removed;
-    return raw_off_publish(&removed);
+    int removed, saved;
+    return raw_off_publish(&removed, &saved);
 }
 
 int raw_off_command(const char *lock_path) {
@@ -889,13 +890,20 @@ int raw_off_command(const char *lock_path) {
         return 1;
     }
     /* The status written under the lock: a daemon starting next writes its
-     * own only after it has the lock. */
-    int removed;
-    int r = raw_off_publish(&removed);
+     * own only after it has the lock. Nothing retries it after this process,
+     * so a status not saved fails the command: the file still shows what the
+     * stopped daemon left, raw_guard=on (Codex review). */
+    int removed, saved;
+    int r = raw_off_publish(&removed, &saved);
     close(fd);
     if (r != 0) {
         LOG_ERROR("raw guard chain %s not fully removed", GUARD_CHAIN);
         return 1;
+    }
+    if (!saved) {
+        LOG_ERROR("raw guard chain %s removed, but the status file was not saved and may still "
+                  "show it on; run hrneo --raw-off again once it can be written", GUARD_CHAIN);
+        return 3;
     }
     printf("hrneo: %s; the next start with RawGuard=true puts it back\n",
            removed ? "raw guard chain " GUARD_CHAIN " removed" : "no raw guard chain " GUARD_CHAIN " to remove");
