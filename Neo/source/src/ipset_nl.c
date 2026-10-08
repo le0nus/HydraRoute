@@ -606,8 +606,14 @@ int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
         /* Entries added without timeout are the permanent ones. One not known
          * to be acknowledged (not sent, its answer lost or out of step) may be
          * in the set without being in the index: stop refreshing that set.
-         * A DNS entry left out comes again with the next answer. */
+         * A DNS entry sent without an answer may be in the set too, and the
+         * next answer for it gets EXIST, which flushes nothing: it counts as
+         * new for ConntrackFlush now (Ruling 52; a flush too many is harmless).
+         * One not sent is not in the set and comes again with the next answer. */
         if (rc != 0) {
+            if (with_timeout && new_indices)
+                for (int i = answered; i < sent; i++)
+                    new_indices[(*new_count)++] = valid_indices[i];
             nl_reopen(mgr, rc, lost_errno);
             if (!with_timeout) ipset_perm_mark_incomplete(mgr, set_name_nul);
             result = -1;

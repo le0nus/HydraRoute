@@ -118,6 +118,8 @@ static int process_hostname_event(const char *domain,
     else
         LOG_MATCH("[%s] %s -> %s", source_tag, domain, ipset_name);
 
+    /* new_count is used whatever ipset_add_batch returns: on -1 it still
+     * holds the new entries and those whose answer was lost (Ruling 52). */
     parsed_cidr_t all_new[64];
     int all_new_count = 0;
 

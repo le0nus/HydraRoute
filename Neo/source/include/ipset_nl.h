@@ -56,6 +56,14 @@ void ipset_manager_close(ipset_manager_t *mgr);
 int ipset_create(ipset_manager_t *mgr, const char *name, const char *type, int family, uint32_t timeout, uint32_t maxelem);
 int ipset_flush(ipset_manager_t *mgr, const char *name);
 
+/* Adds entries to set_name: with_timeout for DNS/L7 entries (IpsetTimeout,
+ * NLM_F_EXCL; an existing one is refreshed), without for the CIDR lists
+ * (permanent). With with_timeout, new_indices (room for count) gets the
+ * index of every entry that is new, and of every entry sent whose answer did
+ * not come, since it may be in the set now (Ruling 52): the caller flushes
+ * conntrack for all of them, also when the call returns -1. Returns 0, or -1
+ * when some entry's result is not known (not sent, answer lost or out of
+ * step) or, for permanent entries, the kernel refused one. */
 int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
                     const parsed_cidr_t *entries, int count,
                     int with_timeout, int *new_count, int *new_indices);

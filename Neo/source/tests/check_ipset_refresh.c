@@ -699,13 +699,14 @@ int main(void) {
     assert(sock_of(q.fd)->timeo_ms == 1000);
 
     /* The answer to a DNS ADD is lost: one recv, which times out, then the
-     * call returns. The answer turns up later, on the replaced socket, and
-     * does not reach the next calls. */
+     * call returns. The ADD may have gone in, so it is reported new (Ruling
+     * 52). The answer turns up later, on the replaced socket, and does not
+     * reach the next calls. */
     g0 = gen_of(q.fd);
     reset();
     drop_at = 0;
     assert(ipset_add_batch(&q, "HydraRoute", &dns_a, 1, 1, &new_count, new_idx) == -1);
-    assert(recv_count == 1 && new_count == 0);
+    assert(recv_count == 1 && new_count == 1 && new_idx[0] == 0);
     assert(gen_of(q.fd) != g0 && sock_of(q.fd)->timeo_ms == 1000);
     deliver_late();
     for (int round = 0; round < 2; round++) {
@@ -717,12 +718,66 @@ int main(void) {
         assert(ipset_add_batch(&q, "HydraRoute", &dns_b, 1, 1, &new_count, new_idx) == 0);
         assert(new_count == 1);
     }
+    /* Ruling 52: the kernel did the ADD, its answer is lost. The next answer
+     * for that IP gets EXIST, which flushes nothing, so the unknown result
+     * counts as new now and ConntrackFlush runs for it; a flush too many is
+     * harmless. The first IP's answer comes (new), the second's is lost. */
+    parsed_cidr_t lost2[2] = {dns_a, dns_a};
+    lost2[0].ip[3] = 40;
+    lost2[1].ip[3] = 41;
+    int lost_idx[3];
+    g0 = gen_of(q.fd);
+    reset();
+    drop_at = 1;
+    assert(ipset_add_batch(&q, "HydraRoute", lost2, 2, 1, &new_count, lost_idx) == -1);
+    assert(new_count == 2 && lost_idx[0] == 0 && lost_idx[1] == 1);
+    assert(gen_of(q.fd) != g0);
+    deliver_late();
+    /* The next answer for the second IP: EXIST, refreshed, not new, and the
+     * calls after it work as usual. */
+    reset();
+    replies[0] = IPSET_ERR_EXIST;
+    assert(ipset_add_batch(&q, "HydraRoute", &lost2[1], 1, 1, &new_count, new_idx) == 0);
+    assert(sent_count == 2 && !(sent_flags[1] & NLM_F_EXCL) && new_count == 0);
+    assert(queued(q.fd) == 0);
+    reset();
+    assert(ipset_add_batch(&q, "HydraRoute", &dns_b, 1, 1, &new_count, new_idx) == 0);
+    assert(new_count == 1 && queued(q.fd) == 0);
+    /* An answer out of step leaves it and every ADD after it unknown: those
+     * are new. The first one was known: it is refreshed, not new. */
+    parsed_cidr_t step3[3] = {dns_a, dns_a, dns_a};
+    step3[0].ip[3] = 43;
+    step3[1].ip[3] = 44;
+    step3[2].ip[3] = 45;
+    reset();
+    replies[0] = IPSET_ERR_EXIST;
+    recv_seq_off_at = 1;
+    assert(ipset_add_batch(&q, "HydraRoute", step3, 3, 1, &new_count, lost_idx) == -1);
+    assert(new_count == 2 && lost_idx[0] == 1 && lost_idx[1] == 2);
+    assert(sent_count == 4 && !(sent_flags[3] & NLM_F_EXCL) && queued(q.fd) == 0);
+    /* An ADD never sent is not new: the kernel never saw it, and the next
+     * answer adds it as a new IP. The two sent ones are unknown (the first
+     * answer lost, the second then out of step). */
+    step3[0].ip[3] = 46;
+    step3[1].ip[3] = 47;
+    step3[2].ip[3] = 48;
+    reset();
+    drop_at = 0;
+    send_fail_at = 2;
+    assert(ipset_add_batch(&q, "HydraRoute", step3, 3, 1, &new_count, lost_idx) == -1);
+    assert(sent_count == 2 && new_count == 2 && lost_idx[0] == 0 && lost_idx[1] == 1);
+    deliver_late();
+    reset();
+    assert(ipset_add_batch(&q, "HydraRoute", &step3[2], 1, 1, &new_count, new_idx) == 0);
+    assert(new_count == 1 && queued(q.fd) == 0);
+
     /* Lost on a permanent ADD: the result is unknown, so the set's index
      * may lack the host. */
     reset();
     drop_at = 0;
     assert(ipset_add_batch(&q, "L", &host, 1, 0, &new_count, new_idx) == -1);
     assert(recv_count == 1 && ipset_perm_incomplete(&q, "L"));
+    assert(new_count == 0);                     /* no new_indices on the permanent path */
     deliver_late();
     assert(queued(q.fd) == 0);
     /* Lost on the refresh of an EXIST: the next call is not shifted either. */
