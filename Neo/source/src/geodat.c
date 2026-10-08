@@ -82,6 +82,7 @@ static int pb_next_field(const uint8_t *data, int len, int *pos, pb_field_t *out
     return -1;
 }
 
+/* 0 an entry, 1 a valid all-zero network (skipped on purpose), -1 malformed. */
 static int parse_cidr_body(const uint8_t *data, int len, geoip_entry_t *entry) {
     memset(entry, 0, sizeof(*entry));
     int pos = 0;
@@ -97,19 +98,19 @@ static int parse_cidr_body(const uint8_t *data, int len, geoip_entry_t *entry) {
             entry->prefix = (uint32_t)f.varint;
         }
     }
-    if (rc < 0) return -1;
+    if (rc < 0 || entry->ip_len == 0) return -1;
 
     int all_zero = 1;
     for (int i = 0; i < 16; i++) {
         if (entry->ip[i] != 0) { all_zero = 0; break; }
     }
-    if (all_zero) return -1;
+    if (all_zero) return 1;
 
     return 0;
 }
 
 /* fn returns nonzero when it could not keep the entry (no memory). The walk
- * returns -1 if it stopped early: a broken field, or an entry fn dropped. */
+ * returns -1 if it stopped early or met a malformed entry, or fn dropped one. */
 typedef int (*geoip_cidr_fn)(const geoip_entry_t *entry, void *ctx);
 
 static int for_each_geoip_cidr(const uint8_t *data, int len,
@@ -121,8 +122,9 @@ static int for_each_geoip_cidr(const uint8_t *data, int len,
     while ((rc = pb_next_field(data, len, &pos, &f)) == 1) {
         if (f.field != 2 || f.wire_type != 2) continue;
         geoip_entry_t entry;
-        if (parse_cidr_body(f.body, f.body_len, &entry) == 0 && fn(&entry, ctx) != 0)
-            return -1;
+        int pr = parse_cidr_body(f.body, f.body_len, &entry);
+        if (pr < 0) return -1;
+        if (pr == 0 && fn(&entry, ctx) != 0) return -1;
     }
     return rc < 0 ? -1 : 0;
 }
@@ -229,13 +231,14 @@ static int scan_dat_file(const char *file_path, const char *target_upper,
         if (!body) { cut = 1; break; }
         if (fread(body, 1, body_len, f) != body_len) { free(body); cut = 1; break; }
 
-        if (body_len < 2 || body[0] != 0x0A) { free(body); continue; }
+        /* A broken country header: this record may be the one wanted. */
+        if (body_len < 2 || body[0] != 0x0A) { free(body); cut = 1; continue; }
 
         uint64_t code_len;
         int br = read_varint(body, (int)body_len, 1, &code_len);
-        if (br < 0) { free(body); continue; }
+        if (br < 0) { free(body); cut = 1; continue; }
         int code_start = 1 + br;
-        if (code_start + (int)code_len > (int)body_len) { free(body); continue; }
+        if (code_start + (int)code_len > (int)body_len) { free(body); cut = 1; continue; }
 
         char code[64] = {0};
         size_t clen = code_len < sizeof(code) - 1 ? code_len : sizeof(code) - 1;

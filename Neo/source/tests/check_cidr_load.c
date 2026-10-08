@@ -125,6 +125,30 @@ int main(void) {
     rc = add_cidr_to_ipsets(&mgr, "build/cidr.list", (const char (*)[512])geo, 1, 100000);
     assert(rc != 0 && rc != -ENOENT && fail_realloc == 0);
 
+    /* Structural errors inside the GeoIP file count the same, wherever they
+     * are: a nested entry with a cut prefix varint (198.51.100.7), and a
+     * country header whose code runs past its record. */
+    static const uint8_t bad_entry[] = {0x0a, 0x0e, 0x0a, 0x02, 0x58, 0x58, 0x12, 0x08,
+                                        0x0a, 0x04, 0xc6, 0x33, 0x64, 0x07, 0x10, 0x80};
+    static const uint8_t no_ip[] = {0x0a, 0x08, 0x0a, 0x02, 0x58, 0x58, 0x12, 0x02, 0x10, 0x20};
+    static const uint8_t bad_header[] = {0x0a, 0x03, 0x0a, 0x05, 0x58};
+    const struct { const uint8_t *b; size_t n; } corrupt[] = {
+        {bad_entry, sizeof(bad_entry)}, {bad_header, sizeof(bad_header)}, {no_ip, sizeof(no_ip)}};
+    for (size_t i = 0; i < 3; i++) {
+        f = fopen("build/geo.dat", "wb");
+        fwrite(corrupt[i].b, 1, corrupt[i].n, f);
+        fclose(f);
+        rc = add_cidr_to_ipsets(&mgr, "build/cidr.list", (const char (*)[512])geo, 1, 100000);
+        assert(rc != 0 && rc != -ENOENT);
+    }
+    /* An all-zero network (0.0.0.0/0) is valid and skipped on purpose: no failure. */
+    static const uint8_t zero_net[] = {0x0a, 0x0e, 0x0a, 0x02, 0x58, 0x58, 0x12, 0x08,
+                                       0x0a, 0x04, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00};
+    f = fopen("build/geo.dat", "wb");
+    fwrite(zero_net, 1, sizeof(zero_net), f);
+    fclose(f);
+    assert(add_cidr_to_ipsets(&mgr, "build/cidr.list", (const char (*)[512])geo, 1, 100000) == 0);
+
     remove("build/geo.dat");
     remove("build/cidr.list");
 
