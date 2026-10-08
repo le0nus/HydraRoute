@@ -33,6 +33,7 @@ static int hr_open;                     /* the peer keeps the connection open af
 static const char *reply;
 static size_t reply_len, reply_off;
 static int reply_err, reply_open, late_recvs;
+static size_t chunk;                    /* bytes per recv of an RCI reply, 0: all that fits */
 
 static size_t put_msg(size_t off, uint16_t type, uint32_t seq, const void *payload, size_t plen) {
     struct nlmsghdr *h = (struct nlmsghdr *)(dump + off);
@@ -164,7 +165,8 @@ ssize_t __wrap_recv(int fd, void *buf, size_t len, int flags) {
         memcpy(buf, dump, n);
         return (ssize_t)((flags & MSG_TRUNC) ? dump_len : n);
     }
-    size_t left = reply_len - reply_off, n = left < len ? left : len;
+    size_t left = reply_len - reply_off, n = chunk && left > chunk ? chunk : left;
+    if (n > len) n = len;
     if (n == 0) {
         if (reply_open) {
             late_recvs++;
@@ -203,7 +205,12 @@ int main(void) {
         {"404 chunked, cut",        BYTES("HTTP/1.1 404 Not Found\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab"), 0},
         {"200 chunked, cut",        BYTES("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n\"ff3"), 0},
         {"200 \"\" NUL x",          BYTES("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n\"\"\0x"), 0},
+        {"404 LF before length",    BYTES("HTTP/1.1 404 Not Found\nContent-Length: 9\r\n\r\nab"), 0},
+        {"200 LF before length",    BYTES("HTTP/1.1 200 OK\nContent-Length: 20\r\n\r\n\"\""), 0},
+        {"404 LF before chunked",   BYTES("HTTP/1.1 404 Not Found\nTransfer-Encoding: chunked\r\n\r\n"), 0},
+        {"200 LF before chunked",   BYTES("HTTP/1.1 200 OK\r\nServer: ndm\nTransfer-Encoding: chunked\r\n\r\n\"\""), 0},
     };
+    static const size_t splits[] = {0, 1, 5, 7};
     config_t cfg;
     unified_target_t t[2];
     setup_targets(t, &cfg);
@@ -242,18 +249,22 @@ int main(void) {
     /* The rule is really gone, and RCI fails in ways that are not "no such
      * policy": the known mark and its rules stay, the commit is retried
      * (Ruling 33). One WARN for the rule, one for the cause. */
-    for (size_t i = 0; i < sizeof(failed) / sizeof(failed[0]); i++) {
-        hr_reply = failed[i].reply;
-        hr_len = failed[i].len;
-        hr_err = failed[i].err;
+    for (size_t i = 0; i < sizeof(failed) / sizeof(failed[0]) * 4; i++) {
+        size_t k = i / 4;
+        chunk = splits[i % 4];
+        hr_reply = failed[k].reply;
+        hr_len = failed[k].len;
+        hr_err = failed[k].err;
         reset();
         if (apply_unified_connmark_rules(t, 2, &cfg, NULL) != -1 || rci_calls != 1) {
-            fprintf(stderr, "check_recheck: %s taken as an answer\n", failed[i].what);
+            fprintf(stderr, "check_recheck: %s (recv by %zu) taken as an answer\n",
+                    failed[k].what, chunk);
             assert(0);
         }
         assert(warns == (i == 0 ? 2 : 0));
         assert_kept();
     }
+    chunk = 0;
     hr_err = 0;
 
     /* A whole 200 with the known mark from a peer that keeps the connection

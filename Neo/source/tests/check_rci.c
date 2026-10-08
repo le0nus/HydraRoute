@@ -9,6 +9,7 @@ static const char *reply = "";
 static size_t reply_len, reply_off;
 static int reply_err;                   /* errno after the reply, 0: EOF */
 static int keep_open, late_recvs;
+static size_t chunk = 5;                /* bytes per recv, 0: all that fits */
 static char request[1024];
 static size_t request_len;
 
@@ -39,7 +40,7 @@ ssize_t __wrap_send(int fd, const void *buf, size_t len, int flags) {
 }
 
 ssize_t __wrap_recv(int fd, void *buf, size_t len, int flags) {
-    size_t left = reply_len - reply_off, n = left < 5 ? left : 5;
+    size_t left = reply_len - reply_off, n = chunk && left > chunk ? chunk : left;
     (void)fd; (void)flags;
     if (n > len) n = len;
     if (n == 0) {
@@ -200,6 +201,25 @@ static void check_policy_mark_answers(void) {
         /* a NUL in the body must not hide what follows it */
         {"200 \"\" NUL x",           BYTES("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n\"\"\0x"), 0, 0, RCI_MARK_TRANSPORT, NULL},
         {"200 mark NUL x",           BYTES("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n\"ffffaaa\"\0x"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        /* Ruling 36: a broken header block is no answer, whatever it says */
+        {"404 LF before length",     BYTES("HTTP/1.1 404 Not Found\nContent-Length: 9\r\n\r\nab"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"200 LF before length",     BYTES("HTTP/1.1 200 OK\nContent-Length: 20\r\n\r\n\"\""), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"404 LF before chunked",    BYTES("HTTP/1.1 404 Not Found\nTransfer-Encoding: chunked\r\n\r\n"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"200 LF before chunked",    BYTES("HTTP/1.1 200 OK\r\nServer: ndm\nTransfer-Encoding: chunked\r\n\r\n\"\""), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"404 CR before length",     BYTES("HTTP/1.1 404 Not Found\rContent-Length: 9\r\n\r\nab"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"404 length, no colon",     BYTES("HTTP/1.1 404 Not Found\r\nContent-Length 9\r\n\r\nab"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"404 header, no colon",     BYTES("HTTP/1.1 404 Not Found\r\nServer ndm\r\nContent-Length: 0\r\n\r\n"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"broken block, kept open",  BYTES("HTTP/1.1 404 Not Found\nContent-Length: 0\r\n\r\n"), 0, 1, RCI_MARK_TRANSPORT, NULL},
+        {"length past any buffer",   BYTES("HTTP/1.1 404 Not Found\r\nContent-Length: 99999999999999999999999\r\n\r\n"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"chunked, then a length",   BYTES("HTTP/1.1 404 Not Found\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"404 space before colon",   BYTES("HTTP/1.1 404 Not Found\r\nContent-Length : 9\r\n\r\nab"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"404 folded line",          BYTES("HTTP/1.1 404 Not Found\r\nServer: ndm\r\n Content-Length: 9\r\n\r\nab"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"404 NUL in a header",      BYTES("HTTP/1.1 404 Not Found\r\nServer: n\0m\r\nContent-Length: 0\r\n\r\n"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"length, then no colon",    BYTES("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nServer ndm\r\n\r\n"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"HTTP/2.0 status line",     BYTES("HTTP/2.0 404 Not Found\r\nContent-Length: 0\r\n\r\n"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"HTTP/2 status line",       BYTES("HTTP/2 404 Not Found\r\nContent-Length: 0\r\n\r\n"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"four-digit status",        BYTES("HTTP/1.1 4040 Not Found\r\nContent-Length: 0\r\n\r\n"), 0, 0, RCI_MARK_TRANSPORT, NULL},
+        {"404 no reason",            BYTES("HTTP/1.1 404\r\nContent-Length: 0\r\n\r\n"), 0, 0, RCI_MARK_ABSENT, NULL},
         {"200 garbage",              BYTES("HTTP/1.1 200 OK\r\n\r\n<html>busy</html>"), 0, 0, RCI_MARK_TRANSPORT, NULL},
         {"200 not hex",              BYTES("HTTP/1.1 200 OK\r\n\r\n\"zz\""), 0, 0, RCI_MARK_TRANSPORT, NULL},
         {"200 zero",                 BYTES("HTTP/1.1 200 OK\r\n\r\n\"0\""), 0, 0, RCI_MARK_TRANSPORT, NULL},
@@ -217,24 +237,58 @@ static void check_policy_mark_answers(void) {
         {"nothing",                  BYTES(""), ECONNRESET, 0, RCI_MARK_TRANSPORT, NULL},
     };
     static const char want_req[] = "GET /rci/show/ip/policy/HydraRoute/mark HTTP/1.0\r\n";
+    static const size_t splits[] = {1, 5, 7, 0};
     rci_set_token("");
-    for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+    for (size_t i = 0; i < sizeof(c) / sizeof(c[0]) * 4; i++) {
         char mark[16] = "";
-        serve(c[i].reply, c[i].len, c[i].err, c[i].open);
+        size_t k = i / 4;
+        chunk = splits[i % 4];
+        serve(c[k].reply, c[k].len, c[k].err, c[k].open);
         int r = rci_get_policy_mark("HydraRoute", mark, sizeof(mark));
-        if (r != c[i].want || (c[i].mark && strcmp(mark, c[i].mark) != 0)) {
-            fprintf(stderr, "check_rci: %s: got %d '%s', want %d\n", c[i].what, r, mark, c[i].want);
+        if (r != c[k].want || (c[k].mark && strcmp(mark, c[k].mark) != 0)) {
+            fprintf(stderr, "check_rci: %s (recv by %zu): got %d '%s', want %d\n",
+                    c[k].what, chunk, r, mark, c[k].want);
             assert(0);
         }
         /* open 1: the answer is whole by its length, or its framing is not
          * read at all: no recv after it. open 2: no length, so only the
          * close can end it: one recv that waits out the timeout. */
-        if (c[i].open && late_recvs != (c[i].open == 2)) {
-            fprintf(stderr, "check_rci: %s: %d recv after the answer\n", c[i].what, late_recvs);
+        if (c[k].open && late_recvs != (c[k].open == 2)) {
+            fprintf(stderr, "check_rci: %s: %d recv after the answer\n", c[k].what, late_recvs);
             assert(0);
         }
         assert(strncmp(request, want_req, sizeof(want_req) - 1) == 0);
     }
+    chunk = 5;
+    g_auth_stale = 0;
+
+    /* A header line longer than the reader takes is no answer either. */
+    {
+        static char longline[1600];
+        int n = snprintf(longline, sizeof(longline), "HTTP/1.1 404 Not Found\r\nServer: ");
+        memset(longline + n, 'a', 1100);
+        n += 1100;
+        n += snprintf(longline + n, sizeof(longline) - (size_t)n, "\r\nContent-Length: 0\r\n\r\n");
+        char mark[16];
+        serve(longline, (size_t)n, 0, 0);
+        assert(rci_get_policy_mark("HydraRoute", mark, sizeof(mark)) == RCI_MARK_TRANSPORT);
+    }
+
+    /* The auth probe and policy creation take no broken header block as an
+     * answer, however the reply is split. */
+    for (size_t i = 0; i < 4; i++) {
+        static const char names[1][64] = {"HydraRoute"};
+        chunk = splits[i];
+        serve(BYTES("HTTP/1.1 200 OK\nContent-Length: 20\r\n\r\n{}"), 0, 0);
+        assert(rci_probe(0) == 0);
+        serve(BYTES("HTTP/1.1 200 OK\r\nServer: ndm\nTransfer-Encoding: chunked\r\n\r\n{}"), 0, 0);
+        assert(rci_probe(0) == 0);
+        serve(BYTES("HTTP/1.1 200 OK\nContent-Length: 40\r\n\r\n[]"), 0, 0);
+        assert(rci_create_policies(names, 1) == -1);
+        serve(BYTES("HTTP/1.1 200 OK\r\nServer: ndm\nTransfer-Encoding: chunked\r\n\r\n[]"), 0, 0);
+        assert(rci_create_policies(names, 1) == -1);
+    }
+    chunk = 5;
     g_auth_stale = 0;
 
     /* The auth probe sees a status only in a whole answer with a real
@@ -266,6 +320,11 @@ static void check_policy_mark_answers(void) {
 }
 
 int main(void) {
+    config_t quiet;                     /* the WARNs of the failure cases go nowhere */
+    memset(&quiet, 0, sizeof(quiet));
+    strcpy(quiet.log_level, "file");
+    strcpy(quiet.log_file_path, "/dev/null");
+    assert(log_setup(&quiet) == 0);
     check_strip_ansi();
     check_parse_token_value();
     check_collect_token_ids();

@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 
 #define RCI_RAW_MAX      32768
+#define RCI_LINE_MAX     1024           /* longest status or header line read */
 #define RCI_ERR_TRANSPORT (-1)
 #define RCI_ERR_DENIED    (-2)
 #define RCI_ERR_HTTP      (-3)
@@ -78,28 +79,73 @@ static int rci_connect(void) {
     return fd;
 }
 
-/* How the body ends, from the header lines (after the status line, before
- * the blank line that ends at body): its Content-Length; -1 if there is
- * none, so the body ends where the connection closes; -2 for framing hrneo
- * does not read (Ruling 35): any Transfer-Encoding (an HTTP/1.0 client must
- * not get chunked), a Content-Length that is not a number or comes twice. */
-static long body_framing(const char *raw, const char *body) {
-    long length = -1;
-    for (const char *line = strstr(raw, "\r\n"); line && line + 2 < body;
-         line = strstr(line + 2, "\r\n")) {
-        const char *v = line + 2;
-        if (strncasecmp(v, "Transfer-Encoding:", 18) == 0) return -2;
-        if (strncasecmp(v, "Content-Length:", 15) != 0) continue;
-        if (length != -1) return -2;
-        v += 15;
-        while (*v == ' ' || *v == '\t') v++;
-        if (!isdigit((unsigned char)*v)) return -2;
-        char *end;
-        length = strtol(v, &end, 10);
-        while (*end == ' ' || *end == '\t') end++;
-        if (end[0] != '\r' || end[1] != '\n') return -2;
+/* Where the header block of raw[0..total) ends: just past its first
+ * CRLFCRLF, or -1 while it has not arrived. raw[0..from) is known to hold
+ * none, so only the bytes that came since are scanned. */
+static int head_end(const char *raw, int from, int total) {
+    for (int i = from > 3 ? from - 3 : 0; i + 4 <= total; i++)
+        if (memcmp(raw + i, "\r\n\r\n", 4) == 0) return i + 4;
+    return -1;
+}
+
+static int header_is(const char *line, int name_len, const char *name) {
+    return name_len == (int)strlen(name) && strncasecmp(line, name, (size_t)name_len) == 0;
+}
+
+/* The header block raw[0..head), read strictly (Ruling 36): the status line
+ * "HTTP/1.x NNN[ reason]", then "Name: value" lines with a token name; each
+ * line ends in CRLF, none is longer than RCI_LINE_MAX, and the block has no
+ * other CR or LF and no NUL. Sets the status and how the body ends: its
+ * Content-Length, -1 if there is none (the body ends where the connection
+ * closes), -2 for framing hrneo does not read (Ruling 35): any
+ * Transfer-Encoding (an HTTP/1.0 client must not get chunked), a
+ * Content-Length that is not a number or comes twice. Returns 0, or -1 when
+ * the block is broken: then nothing in it can be trusted, the framing least. */
+static int parse_head(const char *raw, int head, int *status, long *length) {
+    *length = -1;
+    for (int i = 0; i < head; i++) {
+        char ch = raw[i];
+        if (ch == '\0' || (ch == '\r' && raw[i + 1] != '\n') ||
+            (ch == '\n' && (i == 0 || raw[i - 1] != '\r')))
+            return -1;
     }
-    return length;
+    const char *line = raw;
+    for (int n = 0; line < raw + head - 2; n++) {
+        const char *eol = memchr(line, '\r', (size_t)(raw + head - line));
+        int len = (int)(eol - line);
+        if (len > RCI_LINE_MAX) return -1;
+        if (n == 0) {
+            if (len < 12 || memcmp(line, "HTTP/1.", 7) != 0 || !isdigit((unsigned char)line[7]) ||
+                line[8] != ' ' || line[9] < '1' || line[9] > '5' ||
+                !isdigit((unsigned char)line[10]) || !isdigit((unsigned char)line[11]) ||
+                (len > 12 && line[12] != ' '))
+                return -1;
+            *status = (line[9] - '0') * 100 + (line[10] - '0') * 10 + (line[11] - '0');
+        } else {
+            int name = 0;
+            while (name < len && (isalnum((unsigned char)line[name]) ||
+                                  strchr("!#$%&'*+-.^_`|~", line[name])))
+                name++;
+            if (name == 0 || name == len || line[name] != ':') return -1;
+            if (header_is(line, name, "Transfer-Encoding")) {
+                *length = -2;
+            } else if (header_is(line, name, "Content-Length")) {
+                const char *v = line + name + 1, *end = line + len;
+                long value = 0;
+                while (v < end && (*v == ' ' || *v == '\t')) v++;
+                if (v == end || !isdigit((unsigned char)*v) || *length != -1) {
+                    *length = -2;
+                } else {
+                    for (; v < end && isdigit((unsigned char)*v); v++)
+                        value = value < RCI_RAW_MAX ? value * 10 + (*v - '0') : RCI_RAW_MAX;
+                    while (v < end && (*v == ' ' || *v == '\t')) v++;
+                    *length = v == end ? value : -2;
+                }
+            }
+        }
+        line = eol + 2;
+    }
+    return 0;
 }
 
 static int rci_request_ex(const char *method, const char *path,
@@ -160,9 +206,8 @@ static int rci_request_ex(const char *method, const char *path,
      * as the body has its length, so a peer that keeps the connection open
      * costs no wait, and at once on framing that is not read (Ruling 35). */
     static char raw[RCI_RAW_MAX];
-    char *body_start = NULL;
     long length = -1;
-    int total = 0, eof = 0;
+    int total = 0, eof = 0, head = -1, status = 0, broken = 0;
     int max_raw = (int)sizeof(raw) - 1;
     while (total < max_raw) {
         int n = recv(fd, raw + total, max_raw - total, 0);
@@ -173,27 +218,18 @@ static int rci_request_ex(const char *method, const char *path,
         }
         total += n;
         raw[total] = '\0';
-        if (!body_start && (body_start = strstr(raw, "\r\n\r\n")) != NULL) {
-            body_start += 4;
-            length = body_framing(raw, body_start);
-        }
-        if (body_start &&
-            (length == -2 || (length >= 0 && total - (body_start - raw) >= length)))
+        if (head < 0 && (head = head_end(raw, total - n, total)) >= 0)
+            broken = parse_head(raw, head, &status, &length) != 0;
+        if (head >= 0 && (broken || length == -2 || (length >= 0 && total - head >= length)))
             break;
     }
     raw[total] = '\0';
     close(fd);
 
-    if (!body_start) return RCI_ERR_TRANSPORT;
-    if (strncmp(raw, "HTTP/", 5) != 0) return RCI_ERR_TRANSPORT;
-    char *status_pos = strchr(raw, ' ');
-    if (!status_pos || status_pos > body_start) return RCI_ERR_TRANSPORT;
-
-    int status = atoi(status_pos + 1);
-    if (status < 100 || status > 599) return RCI_ERR_TRANSPORT;
-    if (length == -2 || (length >= 0 && length != total - (body_start - raw)) ||
+    if (head < 0 || broken || length == -2 || (length >= 0 && length != total - head) ||
         (length == -1 && !eof))
         return RCI_ERR_TRANSPORT;
+    const char *body_start = raw + head;
     if (http_status) *http_status = status;
 
     if (status == 401 || status == 403) {
