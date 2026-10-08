@@ -24,11 +24,15 @@ static int dump_sent;
 #define HTTP_FF1 "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n\"ff1\""
 #define HTTP_FF2 "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n\"ff2\""
 
-static const char *hr_reply = HTTP_FF2; /* RCI's answer for HydraRoute; RU has 0xff1 */
+#define BYTES(s) s, sizeof(s) - 1
+
+static const char *hr_reply = HTTP_FF2; /* RCI's answer for HydraRoute (any bytes); RU has 0xff1 */
+static size_t hr_len = sizeof(HTTP_FF2) - 1;
 static int hr_err;                      /* errno of the recv after it, 0: EOF */
+static int hr_open;                     /* the peer keeps the connection open after it */
 static const char *reply;
-static int reply_err;
-static size_t reply_off;
+static size_t reply_len, reply_off;
+static int reply_err, reply_open, late_recvs;
 
 static size_t put_msg(size_t off, uint16_t type, uint32_t seq, const void *payload, size_t plen) {
     struct nlmsghdr *h = (struct nlmsghdr *)(dump + off);
@@ -96,7 +100,7 @@ int __wrap_socket(int domain, int type, int protocol) {
     assert(domain == AF_INET);
     rci_calls++;
     reply = "";
-    reply_off = 0;
+    reply_len = reply_off = 0;
     return RCI_FD;
 }
 
@@ -134,17 +138,21 @@ ssize_t __wrap_send(int fd, const void *buf, size_t len, int flags) {
     assert(fd == RCI_FD);
     if (strstr(buf, "GET /rci/show/ip/policy/RU/mark ")) {
         reply = HTTP_FF1;
-        reply_err = 0;
+        reply_len = sizeof(HTTP_FF1) - 1;
+        reply_err = reply_open = 0;
     } else {
         assert(strstr(buf, "GET /rci/show/ip/policy/HydraRoute/mark "));
         reply = hr_reply;
+        reply_len = hr_len;
         reply_err = hr_err;
+        reply_open = hr_open;
     }
     return (ssize_t)len;
 }
 
 /* Netlink: the dump in one datagram, then the receive timeout. TCP: the
- * reply, then EOF or the scripted error. */
+ * reply, then EOF, the scripted error, or a peer that keeps the connection
+ * open (a recv would wait out the timeout; counted in late_recvs). */
 ssize_t __wrap_recv(int fd, void *buf, size_t len, int flags) {
     if (fd == NL_FD) {
         size_t n = dump_len < len ? dump_len : len;
@@ -156,8 +164,13 @@ ssize_t __wrap_recv(int fd, void *buf, size_t len, int flags) {
         memcpy(buf, dump, n);
         return (ssize_t)((flags & MSG_TRUNC) ? dump_len : n);
     }
-    size_t left = strlen(reply) - reply_off, n = left < len ? left : len;
+    size_t left = reply_len - reply_off, n = left < len ? left : len;
     if (n == 0) {
+        if (reply_open) {
+            late_recvs++;
+            errno = EAGAIN;
+            return -1;
+        }
         if (!reply_err) return 0;
         errno = reply_err;
         return -1;
@@ -179,13 +192,17 @@ static void assert_kept(void) {
 int main(void) {
     static const struct {
         const char *what, *reply;
+        size_t len;
         int err;
     } failed[] = {
-        {"HTTP 500",                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n", 0},
-        {"200 cut, length says 9",  "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n\"ffff", 0},
-        {"200 cut, no length",      "HTTP/1.0 200 OK\r\n\r\n\"ffff", 0},
-        {"200, then a reset",       "HTTP/1.1 200 OK\r\n\r\n\"ff3\"", ECONNRESET},
-        {"200 garbage",             "HTTP/1.1 200 OK\r\n\r\n<html>busy</html>", 0},
+        {"HTTP 500",                BYTES("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"), 0},
+        {"200 cut, length says 9",  BYTES("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n\"ffff"), 0},
+        {"200 cut, no length",      BYTES("HTTP/1.0 200 OK\r\n\r\n\"ffff"), 0},
+        {"200, then a reset",       BYTES("HTTP/1.1 200 OK\r\n\r\n\"ff3\""), ECONNRESET},
+        {"200 garbage",             BYTES("HTTP/1.1 200 OK\r\n\r\n<html>busy</html>"), 0},
+        {"404 chunked, cut",        BYTES("HTTP/1.1 404 Not Found\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab"), 0},
+        {"200 chunked, cut",        BYTES("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n\"ff3"), 0},
+        {"200 \"\" NUL x",          BYTES("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n\"\"\0x"), 0},
     };
     config_t cfg;
     unified_target_t t[2];
@@ -227,6 +244,7 @@ int main(void) {
      * (Ruling 33). One WARN for the rule, one for the cause. */
     for (size_t i = 0; i < sizeof(failed) / sizeof(failed[0]); i++) {
         hr_reply = failed[i].reply;
+        hr_len = failed[i].len;
         hr_err = failed[i].err;
         reset();
         if (apply_unified_connmark_rules(t, 2, &cfg, NULL) != -1 || rci_calls != 1) {
@@ -238,12 +256,24 @@ int main(void) {
     }
     hr_err = 0;
 
-    /* 404 is RCI's answer for a policy that does not exist: its rules leave
+    /* A whole 200 with the known mark from a peer that keeps the connection
+     * open: taken at once, no wait for the close; nothing changes. */
+    hr_reply = HTTP_FF2;
+    hr_len = sizeof(HTTP_FF2) - 1;
+    hr_open = 1;
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == 0);
+    assert(rci_calls == 1 && late_recvs == 0);
+    assert_kept();
+
+    /* 404 is RCI's answer for a policy that does not exist (Ruling 34),
+     * here too from a peer that keeps the connection open: its rules leave
      * mangle and raw. */
     hr_reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+    hr_len = strlen(hr_reply);
     reset();
     assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == -1);
-    assert(rci_calls == 1 && strcmp(calls, "m4 m6 r4 r6 ") == 0);
+    assert(rci_calls == 1 && late_recvs == 0 && strcmp(calls, "m4 m6 r4 r6 ") == 0);
     assert(strstr(warn_log, "Policy HydraRoute has no mark ID yet"));
     assert_mangle_of(0, 0, 1, 0, 0);
     assert_mangle_of(1, 0, 1, 0, 0);

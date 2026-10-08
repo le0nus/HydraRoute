@@ -78,22 +78,28 @@ static int rci_connect(void) {
     return fd;
 }
 
-/* Content-Length from the header lines (after the status line, before the
- * blank line that ends at body): -1 if there is none, -2 if not a number. */
-static long content_length(const char *raw, const char *body) {
+/* How the body ends, from the header lines (after the status line, before
+ * the blank line that ends at body): its Content-Length; -1 if there is
+ * none, so the body ends where the connection closes; -2 for framing hrneo
+ * does not read (Ruling 35): any Transfer-Encoding (an HTTP/1.0 client must
+ * not get chunked), a Content-Length that is not a number or comes twice. */
+static long body_framing(const char *raw, const char *body) {
+    long length = -1;
     for (const char *line = strstr(raw, "\r\n"); line && line + 2 < body;
          line = strstr(line + 2, "\r\n")) {
         const char *v = line + 2;
+        if (strncasecmp(v, "Transfer-Encoding:", 18) == 0) return -2;
         if (strncasecmp(v, "Content-Length:", 15) != 0) continue;
+        if (length != -1) return -2;
         v += 15;
         while (*v == ' ' || *v == '\t') v++;
         if (!isdigit((unsigned char)*v)) return -2;
         char *end;
-        long n = strtol(v, &end, 10);
+        length = strtol(v, &end, 10);
         while (*end == ' ' || *end == '\t') end++;
-        return end[0] == '\r' && end[1] == '\n' ? n : -2;
+        if (end[0] != '\r' || end[1] != '\n') return -2;
     }
-    return -1;
+    return length;
 }
 
 static int rci_request_ex(const char *method, const char *path,
@@ -150,8 +156,12 @@ static int rci_request_ex(const char *method, const char *path,
 
     /* Only a whole answer counts: its body as long as Content-Length says,
      * or without one, everything up to the close of the connection with no
-     * receive error or timeout and within the buffer. */
+     * receive error or timeout and within the buffer. Reading stops as soon
+     * as the body has its length, so a peer that keeps the connection open
+     * costs no wait, and at once on framing that is not read (Ruling 35). */
     static char raw[RCI_RAW_MAX];
+    char *body_start = NULL;
+    long length = -1;
     int total = 0, eof = 0;
     int max_raw = (int)sizeof(raw) - 1;
     while (total < max_raw) {
@@ -162,21 +172,25 @@ static int rci_request_ex(const char *method, const char *path,
             break;
         }
         total += n;
+        raw[total] = '\0';
+        if (!body_start && (body_start = strstr(raw, "\r\n\r\n")) != NULL) {
+            body_start += 4;
+            length = body_framing(raw, body_start);
+        }
+        if (body_start &&
+            (length == -2 || (length >= 0 && total - (body_start - raw) >= length)))
+            break;
     }
     raw[total] = '\0';
     close(fd);
 
-    char *body_start = strstr(raw, "\r\n\r\n");
     if (!body_start) return RCI_ERR_TRANSPORT;
-    body_start += 4;
-
     if (strncmp(raw, "HTTP/", 5) != 0) return RCI_ERR_TRANSPORT;
     char *status_pos = strchr(raw, ' ');
     if (!status_pos || status_pos > body_start) return RCI_ERR_TRANSPORT;
 
     int status = atoi(status_pos + 1);
     if (status < 100 || status > 599) return RCI_ERR_TRANSPORT;
-    long length = content_length(raw, body_start);
     if (length == -2 || (length >= 0 && length != total - (body_start - raw)) ||
         (length == -1 && !eof))
         return RCI_ERR_TRANSPORT;
@@ -432,12 +446,14 @@ int rci_auth_recover(const char *config_path) {
     return rci_token_bootstrap(config_path);
 }
 
-/* The body of a mark answer: one JSON string, "ffffaaa" (1..8 hex digits,
- * "0x" allowed, not 0), or "" for a policy without a mark yet. Returns
- * RCI_MARK_OK, RCI_MARK_ABSENT for "", RCI_MARK_TRANSPORT for anything else. */
-static int parse_mark(const char *body, char *mark, int mark_size) {
+/* The body of a mark answer, all len bytes of it: one JSON string,
+ * "ffffaaa" (1..8 hex digits, "0x" allowed, not 0), or "" for a policy
+ * without a mark yet. Returns RCI_MARK_OK, RCI_MARK_ABSENT for "",
+ * RCI_MARK_TRANSPORT for anything else. */
+static int parse_mark(const char *body, int len, char *mark, int mark_size) {
     const char *p = body;
     int prefix = 0, nonzero = 0;
+    if (memchr(body, '\0', (size_t)len)) return RCI_MARK_TRANSPORT;  /* would hide what follows */
     while (isspace((unsigned char)*p)) p++;
     if (*p++ != '"') return RCI_MARK_TRANSPORT;
     if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
@@ -476,7 +492,7 @@ int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
         LOG_DEBUG("RCI policy: %s: no whole answer (HTTP %d)", name, status);
         return RCI_MARK_TRANSPORT;
     }
-    int r = parse_mark(response, mark, mark_size);
+    int r = parse_mark(response, len, mark, mark_size);
     if (r == RCI_MARK_OK) LOG_DEBUG("RCI policy: %s mark=0x%s", name, mark);
     else if (r == RCI_MARK_TRANSPORT) LOG_DEBUG("RCI policy: %s: not a mark: %.32s", name, response);
     return r;
