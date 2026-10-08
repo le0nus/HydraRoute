@@ -21,6 +21,7 @@ typedef struct {
     uint32_t mark;          /* mark of the target's rules, 0 while unknown */
     uint8_t  gone;          /* RCI: the policy has no mark, its rules go */
     uint8_t  rule_warned;   /* WARN about its missing NDMS ip rule logged */
+    uint8_t  ask;           /* gone, and the next commit asks RCI again */
     int  warned, warned_r;
 } target_state_t;
 
@@ -355,19 +356,26 @@ static int resolve_mark(const unified_target_t *t, target_state_t *ts) {
             if (ts->mark != (uint32_t)v) ts->rule_warned = 0;  /* its rule: a new episode */
             ts->mark = (uint32_t)v;
             ts->gone = 0;
+            ts->ask = 0;
             ts->warned = 0;
             return 0;
         }
         r = RCI_MARK_TRANSPORT;     /* not a mark: no answer, the known one stays (Ruling 33) */
     }
-    if (r != RCI_MARK_TRANSPORT && r != RCI_MARK_DENIED) {
+    /* Confirmed absent: its rules go, and the commit does not fail over it
+     * (Ruling 49). Retries could not bring the policy back, they would only
+     * ask RCI and read every table again; SIGUSR1 and the slow re-check ask
+     * instead. No answer fails the commit, which asks again on each retry. */
+    int absent = r != RCI_MARK_TRANSPORT && r != RCI_MARK_DENIED;
+    if (absent) {
         ts->gone = 1;
         ts->mark = 0;
+        ts->ask = 0;
     }
-    /* A failed commit is retried until this clears; WARN once per cause. */
+    /* WARN once per cause. */
     if (ts->warned && ts->warned_r == r) {
         LOG_DEBUG("Policy %s mark still unavailable (RCI result %d)", t->pair.ipv4, r);
-        return -1;
+        return absent ? 0 : -1;
     }
     ts->warned = 1;
     ts->warned_r = r;
@@ -379,7 +387,7 @@ static int resolve_mark(const unified_target_t *t, target_state_t *ts) {
     } else {
         LOG_WARN("Policy %s has no mark ID yet", t->pair.ipv4);
     }
-    return -1;
+    return absent ? 0 : -1;
 }
 
 /* §4.4: NDMS keeps "fwmark <mark> lookup <table>" for every policy, so a
@@ -850,6 +858,27 @@ int connmark_target_gone(int index) {
     return index >= 0 && index < MAX_TARGETS && g_states[index].gone;
 }
 
+int connmark_recheck_absent(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        if (!g_states[i].gone) continue;
+        g_states[i].ask = 1;
+        n++;
+    }
+    return n;
+}
+
+int connmark_ask_absent(const unified_target_t *targets, int count) {
+    int due = 0;
+    for (int i = 0; i < count && i < MAX_TARGETS; i++) {
+        target_state_t *ts = &g_states[i];
+        if (!ts->gone) continue;
+        if (resolve_mark(&targets[i], ts) != 0) ts->ask = 1;
+        if (!ts->gone || ts->ask) due = 1;
+    }
+    return due;
+}
+
 int raw_guard_remove(void) {
     int removed, failed_fi;
     return raw_remove_all(&removed, &failed_fi);
@@ -973,7 +1002,8 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
     if (!startup_audit) check_policy_rules(targets, count, recheck);
     for (int i = 0; i < count; i++) {
         target_state_t *ts = &g_states[i];
-        if ((startup_audit || !ts->mark || recheck[i]) && resolve_mark(&targets[i], ts) != 0)
+        int ask = startup_audit || recheck[i] || (!ts->mark && (!ts->gone || ts->ask));
+        if (ask && resolve_mark(&targets[i], ts) != 0)
             incomplete = 1;
     }
 

@@ -279,17 +279,53 @@ int main(void) {
 
     /* 404 is RCI's answer for a policy that does not exist (Ruling 34),
      * here too from a peer that keeps the connection open: its rules leave
-     * mangle and raw. */
+     * mangle and raw, and the commit succeeds (Ruling 49). */
     hr_reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
     hr_len = strlen(hr_reply);
     reset();
-    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == -1);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == 0);
     assert(rci_calls == 1 && late_recvs == 0 && strcmp(calls, "m4 m6 r4 r6 ") == 0);
     assert(strstr(warn_log, "Policy HydraRoute has no mark ID yet"));
     assert_mangle_of(0, 0, 1, 0, 0);
     assert_mangle_of(1, 0, 1, 0, 0);
     assert_raw_of(0, 1, 0);
     assert_raw_of(1, 1, 0);
+    assert(status_has("raw_guard=on"));
+
+    /* The commits after it do not ask about it. */
+    hr_open = 0;
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == 0);
+    assert(rci_calls == 0 && rule_dumps == 1 && calls[0] == '\0');
+
+    /* SIGUSR1 asks again; still a 404: nothing changes. */
+    reset();
+    assert(connmark_recheck_absent() == 1);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == 0);
+    assert(rci_calls == 1 && calls[0] == '\0');
+
+    /* The slow re-check gets a 200 cut short: no answer, so a commit is due;
+     * it asks again, gets the same, and fails (retried). */
+    hr_reply = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n\"ffff";
+    hr_len = strlen(hr_reply);
+    reset();
+    assert(connmark_ask_absent(t, 2) == 1 && rci_calls == 1);
+    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == -1);
+    assert(rci_calls == 2 && calls[0] == '\0');
+
+    /* The policy is back with its mark and its ip rule: the retry gets the
+     * mark and puts its rules back, mangle, then raw. */
+    hr_reply = HTTP_FF2;
+    hr_len = sizeof(HTTP_FF2) - 1;
+    hr_rule = 1;
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, &cfg, NULL) == 0);
+    assert(rci_calls == 1 && strcmp(calls, "m4 m6 r4 r6 ") == 0);
+    assert_mangle(0, 0, 0xff2, 0);
+    assert_mangle(1, 0, 0xff2, 0);
+    assert_raw(0, 0xff2);
+    assert_raw(1, 0xff2);
+    assert(status_has("raw_guard=on"));
 
     puts("check_recheck: OK");
     return 0;

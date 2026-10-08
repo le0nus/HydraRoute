@@ -75,6 +75,25 @@ int main(void) {
     assert(on_timer(&s, -1) == 50);
     assert(s.event == COMMIT_EV_FAILED);
 
+    /* The slow re-check of policies confirmed absent (Ruling 49): due once
+     * every COMMIT_RECHECK_SEC of monitor rounds, then counted from zero. */
+    commit_sched_t r;
+    memset(&r, 0, sizeof(r));
+    for (int round = 0; round < 3; round++) {
+        for (int i = 0; i < 5; i++) assert(commit_sched_recheck_due(&r, 10) == 0);
+        assert(commit_sched_recheck_due(&r, 10) == 1);
+    }
+    assert(commit_sched_recheck_due(&r, 59) == 0);
+    assert(commit_sched_recheck_due(&r, 1) == 1);
+    assert(commit_sched_recheck_due(&r, 150) == 1);    /* a late round: due once */
+    assert(commit_sched_recheck_due(&r, 10) == 0);
+    /* Commits and their retries do not move it. */
+    assert(commit_sched_recheck_due(&r, 40) == 0);
+    on_signal(&r, -1);
+    on_timer(&r, -1);
+    on_timer(&r, 0);
+    assert(commit_sched_recheck_due(&r, 10) == 1);
+
     puts("check_commit_sched: OK");
     return 0;
 }

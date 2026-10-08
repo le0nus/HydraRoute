@@ -38,6 +38,16 @@ uint32_t connmark_target_mark(int index);
 /* 1 once RCI said the policy of target index is gone (deleted in Keenetic):
  * its rules left mangle and raw, until a mark comes back. */
 int connmark_target_gone(int index);
+/* A policy RCI confirmed absent does not fail the commit, and the commits
+ * after it do not ask RCI about it again (Ruling 49): it is asked again only
+ * on SIGUSR1 and every COMMIT_RECHECK_SEC. SIGUSR1: the next commit asks RCI
+ * for each such policy. Returns how many there are. */
+int connmark_recheck_absent(void);
+/* The slow re-check: asks RCI now for each policy confirmed absent. Returns
+ * 1 when a commit is due: one has a mark again (the commit puts its rules
+ * in), or RCI gave no answer (the commit asks again, and is retried as on
+ * any RCI failure); else 0. */
+int connmark_ask_absent(const unified_target_t *targets, int count);
 void iptables_delete_rules_matching(const char *ipt_cmd, const char *chain,
                                     const char *needle1, const char *needle2);
 

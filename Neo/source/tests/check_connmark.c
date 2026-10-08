@@ -122,11 +122,13 @@ static void check_start_and_migration(const unified_target_t *t, config_t *cfg) 
      * families; RU moves to R0..R3. No unconditional restore is left and every
      * remaining policy has its mark: the migration from hrneo before 1le2.
      * Mangle is replaced and read back in both families before the raw chain
-     * goes in (§3.2); the fake asserts no unconditional restore while it marks. */
+     * goes in (§3.2); the fake asserts no unconditional restore while it marks.
+     * A policy confirmed absent does not fail the commit (Ruling 49): the
+     * start is over. */
     reset();
     rci_result = RCI_MARK_OK;
     rci_result_hr = RCI_MARK_ABSENT;
-    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
     assert(rci_calls == 2 && warns == 2);
     assert(strstr(warn_log, "Policy HydraRoute has no mark ID yet"));
     assert(strstr(warn_log, "raw guard on again (was degraded: no-mark-v4)"));
@@ -138,50 +140,67 @@ static void check_start_and_migration(const unified_target_t *t, config_t *cfg) 
     assert_raw_of(0, 1, 0);
     assert_raw_of(1, 1, 0);
     assert(status_has("raw_guard=on") && status_has("raw_rules_v4=1") && status_has("raw_rules_v6=1"));
+    assert(connmark_target_gone(1) && connmark_target_mark(0) == 0xff1);
 
-    /* The same again: no WARN, nothing to change. RU's mark is known, but
-     * RCI is asked for every policy until the start is over: no ip rule dump. */
-    reset();
-    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
-    assert(rci_calls == 2 && warns == 0 && rule_dumps == 0);
-    assert(restores[0][0] == 0 && restores[1][0] == 0);
-    assert(calls[0] == '\0');
+    /* The commits after the start dump the ip rules; RU's is there, so
+     * nobody is asked, HydraRoute included: nothing to change, no WARN. */
+    for (int pass = 0; pass < 3; pass++) {
+        reset();
+        assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+        assert(rci_calls == 0 && warns == 0 && rule_dumps == 1);
+        assert(calls[0] == '\0');
+    }
 
-    /* HydraRoute gets its mark, which RCI spells with a leading zero and
-     * capitals; RCI fails for RU, which keeps the rules of its known mark.
-     * Every mark is known: the chain gets HydraRoute too. */
+    /* SIGUSR1: HydraRoute is asked again and has its mark now, which RCI
+     * spells with a leading zero and capitals. RU's ip rule is missing and
+     * RCI fails for it: RU keeps the rules of its known mark, the commit is
+     * retried. Every mark is known: the chain gets HydraRoute too. */
     reset();
+    assert(connmark_recheck_absent() == 1);
+    fake_rules[0].mark = 0xfe1;
     rci_result_ru = RCI_MARK_TRANSPORT;
     rci_result_hr = RCI_MARK_OK;
     mark_hr = "0FF2";
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
-    assert(warns == 1 && strstr(warn_log, "RCI unreachable while reading policy RU"));
+    assert(rci_calls == 2 && warns == 2);
+    assert(strstr(warn_log, "Policy RU: no ip rule for fwmark 0xff1, reading its mark again"));
+    assert(strstr(warn_log, "RCI unreachable while reading policy RU"));
     assert(restores[0][0] == 1 && restores[1][0] == 1);
     assert(strcmp(calls, "m4 m6 r4 r6 ") == 0);
     assert_mangle(0, 1, 0xff2, 0);
     assert_mangle(1, 0, 0xff2, 0);
     assert_raw(0, 0xff2);
     assert_raw(1, 0xff2);
+    assert(!connmark_target_gone(1) && connmark_target_mark(1) == 0xff2);
 
-    /* Once the policy worked, a new failure is reported again; its rules
-     * leave mangle and the chain. */
+    /* Once the policy worked, a new failure is reported again: HydraRoute's
+     * rule is gone too, RCI has no such policy, its rules leave mangle and
+     * the chain. RU answers again; the commit succeeds. */
     reset();
+    fake_rules[1].mark = 0xfe2;
+    rci_result_ru = RCI_MARK_OK;
     rci_result_hr = RCI_MARK_ABSENT;
-    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
-    assert(warns == 1 && strstr(warn_log, "Policy HydraRoute has no mark ID yet"));
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 2 && warns == 2);
+    assert(strstr(warn_log, "Policy HydraRoute: no ip rule for fwmark 0xff2, reading its mark again"));
+    assert(strstr(warn_log, "Policy HydraRoute has no mark ID yet"));
     assert(restores[0][0] == 1 && restores[1][0] == 1);
     assert(strcmp(calls, "m4 m6 r4 r6 ") == 0);
     assert_mangle_of(0, 1, 1, 0, 0);
     assert_mangle_of(1, 0, 1, 0, 0);
     assert_raw_of(0, 1, 0);
     assert_raw_of(1, 1, 0);
+    assert(status_has("raw_guard=on"));
 
-    /* RCI answers for both: one replace per family, and the start is over. */
+    /* The policy is back with both rules (SIGUSR1): one replace per family. */
     reset();
-    rci_result_ru = rci_result_hr = RCI_MARK_OK;
+    fake_rules[0].mark = 0xff1;
+    fake_rules[1].mark = 0xff2;
+    rci_result_hr = RCI_MARK_OK;
+    assert(connmark_recheck_absent() == 1);
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
     mark_hr = "ff2";
-    assert(rci_calls == 2 && warns == 0);
+    assert(rci_calls == 1 && warns == 0);
     assert(restores[0][0] == 1 && restores[1][0] == 1);
     assert(strcmp(calls, "m4 m6 r4 r6 ") == 0);
     assert(strcmp(nf[0].mangle[0], NDM_LINE) == 0);
@@ -893,10 +912,11 @@ static void check_policy_mark_change(const unified_target_t *t, config_t *cfg) {
     assert_raw(1, 0xff3);
     assert(status_has("raw_guard=on"));
 
-    /* Policy deleted: RCI has no mark, its rules leave mangle and raw. */
+    /* Policy deleted: RCI has no mark, its rules leave mangle and raw; the
+     * commit succeeds (Ruling 49). */
     reset();
     rci_result = RCI_MARK_ABSENT;
-    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
     assert(rci_calls == 1);                 /* RU's rule is there: RU is not asked */
     assert(strstr(warn_log, "Policy HydraRoute has no mark ID yet"));
     assert(strcmp(calls, "m4 m6 r4 r6 ") == 0);
@@ -910,10 +930,13 @@ static void check_policy_mark_change(const unified_target_t *t, config_t *cfg) {
     assert(connmark_target_gone(1) && connmark_target_mark(1) == 0);
     assert(!connmark_target_gone(0) && connmark_target_mark(0) == 0xff1);
 
-    /* Policy back: its rules return. */
+    /* Policy back: nothing asks until SIGUSR1, then its rules return. */
     reset();
     rci_result = RCI_MARK_OK;
     fake_rule_count = 2;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 0 && calls[0] == '\0' && connmark_target_gone(1));
+    assert(connmark_recheck_absent() == 1);
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
     assert(rci_calls == 1);
     assert(strcmp(calls, "m4 m6 r4 r6 ") == 0);
@@ -946,6 +969,132 @@ static void check_policy_mark_change(const unified_target_t *t, config_t *cfg) {
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
     assert(rci_calls == 1 && strcmp(calls, "m4 m6 r4 r6 ") == 0);
     assert_raw(0, 0xff3);
+}
+
+/* Ruling 49: a policy RCI confirmed absent does not fail the commit, and
+ * the commits after it do not ask about it: only SIGUSR1 (the next commit
+ * asks) and the slow re-check (asks at once) do. No answer (TRANSPORT,
+ * DENIED) is no "absent": the commit fails, and each retry asks again. */
+static void check_absent_recheck(const unified_target_t *t, config_t *cfg) {
+    /* HydraRoute deleted in Keenetic: its rule goes, RCI has no such policy.
+     * Its rules leave mangle, then raw; the raw guard is on for the rest. */
+    reset();
+    fake_rule_count = 1;
+    rci_result_hr = RCI_MARK_ABSENT;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 1 && strcmp(calls, "m4 m6 r4 r6 ") == 0);
+    assert(connmark_target_gone(1) && status_has("raw_guard=on"));
+    assert_mangle_of(0, 1, 1, 0, 0);
+    assert_raw_of(0, 1, 0);
+    assert_raw_of(1, 1, 0);
+
+    /* Verify commits, commits for other events, and the retries of a
+     * commit failing for another reason: none asks RCI about it. */
+    reset();
+    for (int pass = 0; pass < 3; pass++)
+        assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 0 && calls[0] == '\0' && warns == 0 && rule_dumps == 3);
+    dump_fail[0] = 1;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    dump_fail[0] = 0;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 0);
+
+    /* The slow re-check while it is still absent: one RCI request and
+     * nothing else, no commit due, no new WARN. */
+    reset();
+    assert(connmark_ask_absent(t, 2) == 0);
+    assert(rci_calls == 1 && dumps == 0 && rule_dumps == 0 && warns == 0);
+    assert(connmark_target_gone(1));
+
+    /* SIGUSR1 while it is still absent: the next commit asks once and
+     * succeeds, the one after it does not ask. */
+    reset();
+    assert(connmark_recheck_absent() == 1);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 1 && warns == 0 && calls[0] == '\0');
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 0);
+
+    /* RCI unreachable on the re-check after SIGUSR1: the commit fails and
+     * every retry asks again, until RCI answers; still absent ends it. */
+    reset();
+    assert(connmark_recheck_absent() == 1);
+    rci_result_hr = RCI_MARK_TRANSPORT;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    assert(rci_calls == 2 && calls[0] == '\0' && connmark_target_gone(1));
+    assert(warns == 1 && strstr(warn_log, "RCI unreachable while reading policy HydraRoute"));
+    reset();
+    rci_result_hr = RCI_MARK_ABSENT;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 1 && strstr(warn_log, "Policy HydraRoute has no mark ID yet"));
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 0);
+
+    /* The slow re-check gets no answer (denied): a commit is due, it asks
+     * again and fails, the retry asks again. */
+    reset();
+    rci_result_hr = RCI_MARK_DENIED;
+    assert(connmark_ask_absent(t, 2) == 1);
+    assert(rci_calls == 1 && dumps == 0);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    assert(rci_calls == 2 && calls[0] == '\0');
+    assert(strstr(warn_log, "RCI denied reading policy HydraRoute"));
+    reset();
+    rci_result_hr = RCI_MARK_ABSENT;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 1);
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 0);
+
+    /* The policy is back, recreated as 0xff4: the slow re-check gets its
+     * mark and a commit is due, which rebuilds mangle, then raw, without
+     * asking again. */
+    reset();
+    recreate_hr(0xff4, "ff4");
+    fake_rule_count = 2;
+    rci_result_hr = RCI_MARK_OK;
+    assert(connmark_ask_absent(t, 2) == 1);
+    assert(rci_calls == 1 && dumps == 0);
+    assert(!connmark_target_gone(1) && connmark_target_mark(1) == 0xff4);
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 0 && strcmp(calls, "m4 m6 r4 r6 ") == 0);
+    assert_mangle(0, 1, 0xff4, 0);
+    assert_mangle(1, 0, 0xff4, 0);
+    assert_raw(0, 0xff4);
+    assert_raw(1, 0xff4);
+    assert(status_has("raw_guard=on"));
+
+    /* Nothing absent: neither path asks anything. */
+    reset();
+    assert(connmark_recheck_absent() == 0 && connmark_ask_absent(t, 2) == 0);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 0 && calls[0] == '\0');
+
+    /* Deleted again, back as 0xff3 (for what follows) and found on
+     * SIGUSR1: the commit after the signal rebuilds. */
+    reset();
+    fake_rule_count = 1;
+    rci_result_hr = RCI_MARK_ABSENT;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(connmark_target_gone(1));
+    reset();
+    recreate_hr(0xff3, "ff3");
+    fake_rule_count = 2;
+    rci_result_hr = RCI_MARK_OK;
+    assert(connmark_recheck_absent() == 1);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(rci_calls == 1 && strcmp(calls, "m4 m6 r4 r6 ") == 0);
+    assert_mangle(0, 1, 0xff3, 0);
+    assert_mangle(1, 0, 0xff3, 0);
+    assert_raw(0, 0xff3);
+    assert_raw(1, 0xff3);
 }
 
 /* A new mark goes through the same mangle -> raw gate as any other change:
@@ -1235,6 +1384,7 @@ int main(void) {
     check_interface_target(t, &cfg);
     check_overflow(t, &cfg);
     check_policy_mark_change(t, &cfg);
+    check_absent_recheck(t, &cfg);
     check_mark_change_failures(t, &cfg);
     check_raw_off(t, &cfg);
     check_target_mark();

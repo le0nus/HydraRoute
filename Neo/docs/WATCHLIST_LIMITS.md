@@ -69,6 +69,7 @@
 | `RCI_TIMEOUT_SEC` | 10 | `SO_RCVTIMEO` / `SO_SNDTIMEO` |
 | `NF_VERIFY_INTERVAL_MS` | 250 | Подтверждающий коммит netfilter после успешного коммита по SIGUSR1 |
 | `retry_ms[]` | 50…3000 | Паузы повтора неудачного коммита (`src/commit_sched.c`): 50, 100, 250, 500, 1000 мс, дальше каждые 3 с |
+| `COMMIT_RECHECK_SEC` | 60 | Медленная перепроверка политик с подтверждённым `ABSENT` через RCI (`include/commit_sched.h`); такая политика коммит не роняет и ещё проверяется по каждому SIGUSR1 |
 | `IPT_DUMP_SIZE` | 65536 | Буфер дампа `iptables -t mangle -S <chain>` (PREROUTING + FORWARD/OUTPUT при L7) на семью |
 | `IPT_BATCH_SIZE` | 65536 | Буфер batch для `iptables-restore` на семью; при перестройке в нём и `-D`, и `-A` всех целей |
 | `IPT_MAX_RULE_ARGS` | 64 | Максимум argv-токенов при удалении правила |

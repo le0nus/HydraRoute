@@ -29,9 +29,17 @@ typedef struct {
     int failures;           /* failed commits in a row, or in the episode just ended */
     int step;               /* index of the next retry delay */
     commit_event_t event;   /* what the last call changed */
+    int recheck_s;          /* seconds since the last slow re-check */
 } commit_sched_t;
 
 int commit_sched_on_signal(commit_sched_t *s, commit_update_fn update);
 int commit_sched_on_timer(commit_sched_t *s, commit_update_fn update);
+
+/* The slow re-check of policies RCI confirmed absent (Ruling 49): a commit
+ * does not fail over them, so the retries above never ask about them again.
+ * Called with the seconds since the last call (the guard monitor's round),
+ * it returns 1 once COMMIT_RECHECK_SEC have passed, then starts over. */
+#define COMMIT_RECHECK_SEC 60
+int commit_sched_recheck_due(commit_sched_t *s, int elapsed_s);
 
 #endif

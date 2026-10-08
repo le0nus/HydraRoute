@@ -28,3 +28,10 @@ int commit_sched_on_signal(commit_sched_t *s, commit_update_fn update) {
 int commit_sched_on_timer(commit_sched_t *s, commit_update_fn update) {
     return record(s, update(), 0);
 }
+
+int commit_sched_recheck_due(commit_sched_t *s, int elapsed_s) {
+    s->recheck_s += elapsed_s;
+    if (s->recheck_s < COMMIT_RECHECK_SEC) return 0;
+    s->recheck_s = 0;
+    return 1;
+}

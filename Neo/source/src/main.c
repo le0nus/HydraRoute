@@ -282,6 +282,18 @@ static void commit_start(signal_mgr_t *m) {
     signal_mgr_arm_timer(m, delay);
 }
 
+/* Ruling 49: a policy RCI confirmed absent does not fail the commit, so no
+ * retry asks about it; every COMMIT_RECHECK_SEC of monitor rounds RCI is
+ * asked here, and a commit follows only if one has a mark again or RCI gave
+ * no answer. While policy creation is still pending the commit runs anyway
+ * (it retries the creation) and asks after it. */
+static void absent_tick(signal_mgr_t *m) {
+    if (!commit_sched_recheck_due(&g_commit, GUARD_MONITOR_SEC)) return;
+    if (g_policies_pending ? connmark_recheck_absent() > 0
+                           : connmark_ask_absent(g_all_sorted, g_all_sorted_count))
+        commit_start(m);
+}
+
 static void add_unique_name(char names[][64], int *count, const char *name, int max) {
     for (int i = 0; i < *count; i++) {
         if (strcmp(names[i], name) == 0) return;
@@ -686,6 +698,7 @@ int main(int argc, char *argv[]) {
                 tcp_reasm_gc(&g_reasm);
             } else if (monitor_fd >= 0 && events[i].data.fd == monitor_fd) {
                 guard_monitor_on_timer(monitor_fd);
+                absent_tick(&signals);
             } else if (events[i].data.fd == signals.sig_fd) {
                 struct signalfd_siginfo si;
                 ssize_t s = read(signals.sig_fd, &si, sizeof(si));
@@ -695,6 +708,7 @@ int main(int argc, char *argv[]) {
                         g_shutdown = 1;
                     } else if (si.ssi_signo == SIGUSR1) {
                         LOG_DEBUG("SIGUSR1 received, committing now");
+                        connmark_recheck_absent();      /* NDMS may have recreated it */
                         commit_start(&signals);
                     }
                 }
