@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -73,7 +74,7 @@ static int pb_next_field(const uint8_t *data, int len, int *pos, pb_field_t *out
         int br = read_varint(data, len, *pos, &flen);
         if (br < 0) return -1;
         *pos += br;
-        if (*pos + (int)flen > len) return -1;
+        if (flen > (uint64_t)(len - *pos)) return -1;     /* compared wide, then it fits an int */
         out->body = data + *pos;
         out->body_len = (int)flen;
         *pos += (int)flen;
@@ -227,6 +228,7 @@ static int scan_dat_file(const char *file_path, const char *target_upper,
         uint64_t body_len;
         if (read_varint_stream(f, &body_len) < 0) { cut = 1; break; }
 
+        if (body_len > INT_MAX) { cut = 1; break; }
         uint8_t *body = malloc(body_len);
         if (!body) { cut = 1; break; }
         if (fread(body, 1, body_len, f) != body_len) { free(body); cut = 1; break; }
@@ -235,10 +237,10 @@ static int scan_dat_file(const char *file_path, const char *target_upper,
         if (body_len < 2 || body[0] != 0x0A) { free(body); cut = 1; continue; }
 
         uint64_t code_len;
-        int br = read_varint(body, (int)body_len, 1, &code_len);
+        int br = read_varint(body, (int)body_len, 1, &code_len);   /* body_len <= INT_MAX */
         if (br < 0) { free(body); cut = 1; continue; }
         int code_start = 1 + br;
-        if (code_start + (int)code_len > (int)body_len) { free(body); cut = 1; continue; }
+        if (code_len > body_len - (uint64_t)code_start) { free(body); cut = 1; continue; }
 
         char code[64] = {0};
         size_t clen = code_len < sizeof(code) - 1 ? code_len : sizeof(code) - 1;

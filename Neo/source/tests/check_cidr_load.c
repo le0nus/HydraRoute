@@ -131,10 +131,14 @@ int main(void) {
     static const uint8_t bad_entry[] = {0x0a, 0x0e, 0x0a, 0x02, 0x58, 0x58, 0x12, 0x08,
                                         0x0a, 0x04, 0xc6, 0x33, 0x64, 0x07, 0x10, 0x80};
     static const uint8_t no_ip[] = {0x0a, 0x08, 0x0a, 0x02, 0x58, 0x58, 0x12, 0x02, 0x10, 0x20};
+    /* Header length 0x100000002 (varint 82 80 80 80 10) in a 69-byte record:
+     * it must be compared as 64 bits, not as the 2 an int cast leaves. */
+    static uint8_t wide[2 + 69] = {0x0a, 69, 0x0a, 0x82, 0x80, 0x80, 0x80, 0x10, 'Y', 'Y'};
     static const uint8_t bad_header[] = {0x0a, 0x03, 0x0a, 0x05, 0x58};
     const struct { const uint8_t *b; size_t n; } corrupt[] = {
-        {bad_entry, sizeof(bad_entry)}, {bad_header, sizeof(bad_header)}, {no_ip, sizeof(no_ip)}};
-    for (size_t i = 0; i < 3; i++) {
+        {bad_entry, sizeof(bad_entry)}, {bad_header, sizeof(bad_header)}, {no_ip, sizeof(no_ip)},
+        {wide, sizeof(wide)}};
+    for (size_t i = 0; i < 4; i++) {
         f = fopen("build/geo.dat", "wb");
         fwrite(corrupt[i].b, 1, corrupt[i].n, f);
         fclose(f);
