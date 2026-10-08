@@ -89,11 +89,13 @@ check:
 	./build/check_raw_modules
 	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=run_command_output,--wrap=run_command_stdin,--wrap=log_write,--wrap=l7_firewall_load_kmod_if_present,--wrap=proc_list_has tests/check_raw_start.c src/iptables.c src/guard.c src/guard_status.c src/l7_firewall.c src/util.c src/log.c -o build/check_raw_start
 	./build/check_raw_start
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=run_command_output,--wrap=run_command_stdin,--wrap=log_write,--wrap=l7_firewall_load_kmod_if_present,--wrap=proc_list_has,--wrap=socket,--wrap=bind,--wrap=setsockopt,--wrap=connect,--wrap=send,--wrap=recv,--wrap=close tests/check_recheck.c src/iptables.c src/guard.c src/guard_status.c src/l7_firewall.c src/rtnl.c src/rci.c src/config.c src/params.c src/util.c src/log.c -o build/check_recheck
+	./build/check_recheck
 	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=log_write,--wrap=fwrite,--wrap=fclose,--wrap=rename tests/check_guard_status.c src/guard_status.c src/log.c src/util.c -o build/check_guard_status
 	./build/check_guard_status
 	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=socket,--wrap=bind,--wrap=setsockopt,--wrap=send,--wrap=recv,--wrap=close tests/check_rtnl.c src/rtnl.c -o build/check_rtnl
 	./build/check_rtnl
-	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_rci.c src/util.c src/log.c src/config.c src/params.c -o build/check_rci
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=connect,--wrap=send,--wrap=recv tests/check_rci.c src/util.c src/log.c src/config.c src/params.c -o build/check_rci
 	./build/check_rci
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_config.c src/config.c src/params.c src/args.c src/util.c src/log.c -o build/check_config
 	./build/check_config

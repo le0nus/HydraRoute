@@ -315,6 +315,36 @@ static void check_parse(void) {
     cb_result = -1;
     assert(parse(0, dgram_len[0]) == RTNL_FAIL && counted == 1);
     cb_result = 0;
+
+    /* NLMSG_DONE ends the dump only once the rest of its datagram is
+     * checked: bytes that are no message, a broken header, or anything of
+     * this dump after it (an overrun, an error, a rule) fail the dump. A
+     * message of another request may still follow. */
+    script_reset();
+    put_rule(0, 42, NDMS(0xffffaaa, 4096));
+    put_done(0, 42, 0);
+    assert(parse(0, dgram_len[0] + 8) == RTNL_FAIL);
+    script_reset();
+    put_done(0, 42, 0);
+    put_rule(0, 42, NDMS(0xffffaaa, 4096));
+    last->nlmsg_len = NLMSG_HDRLEN - 8;
+    assert(parse(0, dgram_len[0]) == RTNL_FAIL);
+    script_reset();
+    put_done(0, 42, 0);
+    put_msg(0, NLMSG_OVERRUN, 0, 42, NULL, 0);
+    assert(parse(0, dgram_len[0]) == RTNL_FAIL);
+    script_reset();
+    put_done(0, 42, 0);
+    put_error(0, 42, -EINVAL);
+    assert(parse(0, dgram_len[0]) == RTNL_FAIL);
+    script_reset();
+    put_done(0, 42, 0);
+    put_rule(0, 42, NDMS(0xffffaaa, 4096));
+    assert(parse(0, dgram_len[0]) == RTNL_FAIL);
+    script_reset();
+    put_done(0, 42, 0);
+    put_rule(0, SEQ_OTHER, NDMS(0xffffaaa, 4096));
+    assert(parse(0, dgram_len[0]) == RTNL_DONE);
 }
 
 /* --- rtnl_dump and rtnl_fwmark_rules through the fake socket ---------- */
@@ -524,7 +554,7 @@ static void check_strict(void) {
         {.mark = 0xff2, .mask = 0xffffffffu, .table = 4097, .trailer = 2},
         {.mark = 0xff7, .mask = 0xffffffffu, .table = 4097, .bad = FRA_FWMARK},   /* not even ours */
     };
-    for (int c = 0; c < 13; c++) {
+    for (int c = 0; c < 15; c++) {
         script_reset();
         put_rule(0, SEQ_REQ, NDMS(0xff1, 4096));
         put_rule(0, SEQ_REQ, NDMS(0xff2, 4097));
@@ -544,6 +574,13 @@ static void check_strict(void) {
             uint8_t p[RULE_MAX] __attribute__((aligned(4)));
             rule_t r = NDMS(0xff3, 4098);
             put_msg(0, RTM_NEWROUTE, NLM_F_MULTI, SEQ_REQ, p, rule_payload(p, &r));
+        }
+        if (c == 13 || c == 14) {
+            /* the end of the dump, then in the same datagram an error or
+             * bytes that are no message: not a complete dump either */
+            put_done(0, SEQ_REQ, 0);
+            if (c == 13) put_error(0, SEQ_REQ, -EBUSY);
+            else dgram_len[0] += 8;
         }
         put_done(1, SEQ_REQ, c == 12 ? -EMSGSIZE : 0);
         if (lookup(AF_INET, 2, 0xff1, 0xff2, 0) != -1) {

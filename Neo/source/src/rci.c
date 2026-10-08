@@ -2,8 +2,10 @@
 #include "../include/log.h"
 #include "../include/util.h"
 #include "../include/config.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
@@ -76,6 +78,24 @@ static int rci_connect(void) {
     return fd;
 }
 
+/* Content-Length from the header lines (after the status line, before the
+ * blank line that ends at body): -1 if there is none, -2 if not a number. */
+static long content_length(const char *raw, const char *body) {
+    for (const char *line = strstr(raw, "\r\n"); line && line + 2 < body;
+         line = strstr(line + 2, "\r\n")) {
+        const char *v = line + 2;
+        if (strncasecmp(v, "Content-Length:", 15) != 0) continue;
+        v += 15;
+        while (*v == ' ' || *v == '\t') v++;
+        if (!isdigit((unsigned char)*v)) return -2;
+        char *end;
+        long n = strtol(v, &end, 10);
+        while (*end == ' ' || *end == '\t') end++;
+        return end[0] == '\r' && end[1] == '\n' ? n : -2;
+    }
+    return -1;
+}
+
 static int rci_request_ex(const char *method, const char *path,
                           const char *body, int body_len,
                           char *response, int response_max,
@@ -128,12 +148,19 @@ static int rci_request_ex(const char *method, const char *path,
         }
     }
 
+    /* Only a whole answer counts: its body as long as Content-Length says,
+     * or without one, everything up to the close of the connection with no
+     * receive error or timeout and within the buffer. */
     static char raw[RCI_RAW_MAX];
-    int total = 0;
+    int total = 0, eof = 0;
     int max_raw = (int)sizeof(raw) - 1;
     while (total < max_raw) {
         int n = recv(fd, raw + total, max_raw - total, 0);
-        if (n <= 0) break;
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            eof = n == 0;
+            break;
+        }
         total += n;
     }
     raw[total] = '\0';
@@ -145,9 +172,14 @@ static int rci_request_ex(const char *method, const char *path,
 
     if (strncmp(raw, "HTTP/", 5) != 0) return RCI_ERR_TRANSPORT;
     char *status_pos = strchr(raw, ' ');
-    if (!status_pos) return RCI_ERR_TRANSPORT;
+    if (!status_pos || status_pos > body_start) return RCI_ERR_TRANSPORT;
 
     int status = atoi(status_pos + 1);
+    if (status < 100 || status > 599) return RCI_ERR_TRANSPORT;
+    long length = content_length(raw, body_start);
+    if (length == -2 || (length >= 0 && length != total - (body_start - raw)) ||
+        (length == -1 && !eof))
+        return RCI_ERR_TRANSPORT;
     if (http_status) *http_status = status;
 
     if (status == 401 || status == 403) {
@@ -400,32 +432,54 @@ int rci_auth_recover(const char *config_path) {
     return rci_token_bootstrap(config_path);
 }
 
+/* The body of a mark answer: one JSON string, "ffffaaa" (1..8 hex digits,
+ * "0x" allowed, not 0), or "" for a policy without a mark yet. Returns
+ * RCI_MARK_OK, RCI_MARK_ABSENT for "", RCI_MARK_TRANSPORT for anything else. */
+static int parse_mark(const char *body, char *mark, int mark_size) {
+    const char *p = body;
+    int prefix = 0, nonzero = 0;
+    while (isspace((unsigned char)*p)) p++;
+    if (*p++ != '"') return RCI_MARK_TRANSPORT;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+        prefix = 1;
+    }
+    const char *digits = p;
+    for (; isxdigit((unsigned char)*p); p++)
+        if (*p != '0') nonzero = 1;
+    int n = (int)(p - digits);
+    if (*p++ != '"') return RCI_MARK_TRANSPORT;
+    while (isspace((unsigned char)*p)) p++;
+    if (*p != '\0') return RCI_MARK_TRANSPORT;
+    if (n == 0) return prefix ? RCI_MARK_TRANSPORT : RCI_MARK_ABSENT;
+    if (n > 8 || n > mark_size - 1 || !nonzero) return RCI_MARK_TRANSPORT;
+    memcpy(mark, digits, (size_t)n);
+    mark[n] = '\0';
+    return RCI_MARK_OK;
+}
+
+/* RCI_MARK_ABSENT only on a whole answer that says the policy has no mark:
+ * 404 (no such policy; Keenetic answers this path so) or "" (no mark yet).
+ * Another status, a cut answer or one that is not a mark is no answer
+ * (RCI_MARK_TRANSPORT): the caller keeps the mark it knows (Ruling 33). */
 int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
     char path[160];
     snprintf(path, sizeof(path), "/rci/show/ip/policy/%s/mark", name);
 
     char response[256];
-    int len = rci_request("GET", path, NULL, 0, response, sizeof(response));
-    if (len == RCI_ERR_TRANSPORT) return RCI_MARK_TRANSPORT;
+    int status = 0;
+    int len = rci_request_ex("GET", path, NULL, 0, response, sizeof(response),
+                             rci_should_send_token(), &status);
     if (len == RCI_ERR_DENIED) return RCI_MARK_DENIED;
-    if (len < 0) return RCI_MARK_ABSENT;
-
-    const char *val = strchr(response, '"');
-    if (!val) return RCI_MARK_ABSENT;
-    val++;
-    const char *end = strchr(val, '"');
-    if (!end) return RCI_MARK_ABSENT;
-
-    if (val[0] == '0' && (val[1] == 'x' || val[1] == 'X'))
-        val += 2;
-    int n = (int)(end - val);
-    if (n <= 0) return RCI_MARK_ABSENT;
-    if (n > mark_size - 1) n = mark_size - 1;
-    memcpy(mark, val, n);
-    mark[n] = '\0';
-
-    LOG_DEBUG("RCI policy: %s mark=0x%s", name, mark);
-    return RCI_MARK_OK;
+    if (len == RCI_ERR_HTTP && status == 404) return RCI_MARK_ABSENT;
+    if (len < 0 || len >= (int)sizeof(response) - 1) {
+        LOG_DEBUG("RCI policy: %s: no whole answer (HTTP %d)", name, status);
+        return RCI_MARK_TRANSPORT;
+    }
+    int r = parse_mark(response, mark, mark_size);
+    if (r == RCI_MARK_OK) LOG_DEBUG("RCI policy: %s mark=0x%s", name, mark);
+    else if (r == RCI_MARK_TRANSPORT) LOG_DEBUG("RCI policy: %s: not a mark: %.32s", name, response);
+    return r;
 }
 
 #define RCI_POLICY_CREATE_FMT "{\"ip\":{\"policy\":{\"%s\":{\"description\":\"%s\"}}}},"

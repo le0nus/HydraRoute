@@ -39,20 +39,24 @@ static int rtnl_msg(const struct nlmsghdr *h, rtnl_msg_fn fn, void *ctx) {
 
 int rtnl_parse(const void *buf, size_t len, uint32_t seq, rtnl_msg_fn fn, void *ctx) {
     const char *p = buf;
+    int done = 0;
     while (len > 0) {
         const struct nlmsghdr *h = (const struct nlmsghdr *)p;
         if (len < NLMSG_HDRLEN || h->nlmsg_len < NLMSG_HDRLEN || h->nlmsg_len > len)
             return RTNL_FAIL;                   /* a cut or broken message */
         if (h->nlmsg_seq == seq) {
+            if (done) return RTNL_FAIL;         /* nothing of the dump comes after its end */
             int st = rtnl_msg(h, fn, ctx);
-            if (st != RTNL_MORE) return st;
+            if (st == RTNL_FAIL) return RTNL_FAIL;
+            done = st == RTNL_DONE;
         }
         size_t step = NLMSG_ALIGN(h->nlmsg_len);
         if (step > len) step = len;             /* the last message may go unpadded */
         p += step;
         len -= step;
     }
-    return RTNL_MORE;
+    /* The end counts only once the whole datagram it came in is checked. */
+    return done ? RTNL_DONE : RTNL_MORE;
 }
 
 int rtnl_dump(uint16_t type, uint8_t family, rtnl_msg_fn fn, void *ctx) {

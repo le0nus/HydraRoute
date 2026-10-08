@@ -1,5 +1,7 @@
 /* Fake netfilter, RCI and log for tests that link src/iptables.c.
- * Include from exactly one test file per program. */
+ * Include from exactly one test file per program. A program that links the
+ * real src/rci.c and src/rtnl.c defines FAKE_NF_REAL_RCI_RTNL first and
+ * counts rci_calls and rule_dumps itself. */
 #ifndef FAKE_NF_H
 #define FAKE_NF_H
 
@@ -44,9 +46,11 @@ static fake_nf_t nf[2];
 static int  restores[2][2];            /* [family][0 mangle, 1 raw] */
 static char calls[512];                /* restores in order: "m4 r4 m6 r6 " */
 static int  dumps, rci_calls, warns, errors, kmod_calls;
+#ifndef FAKE_NF_REAL_RCI_RTNL
 static int  rci_result = RCI_MARK_OK;  /* result for every policy ... */
 static int  rci_result_ru = RCI_MARK_OK, rci_result_hr = RCI_MARK_OK;   /* ... unless OK */
 static const char *mark_ru = "ff1", *mark_hr = "ff2";
+#endif
 static const char *restore_error;
 static int  restore_error_family = -1; /* family restore_error applies to, -1: both */
 static int  restore_error_table = -1;  /* table restore_error applies to: 0 mangle, 1 raw, -1 both */
@@ -325,12 +329,14 @@ int __wrap_proc_list_has(const char *path, const char *name) {
     return raw_listed[fi];
 }
 
+static int rule_dumps;
+
+#ifndef FAKE_NF_REAL_RCI_RTNL
 /* The NDMS ip rules of IPv4, "fwmark <mark> lookup <table>": RU (0xff1) and
  * HydraRoute (0xff2). fake_rule_count -1: the dump fails. As the real one,
  * every table is set, 0 for a mark without a rule. */
 static rtnl_fwmark_rule_t fake_rules[8] = {{0xff1, 4096}, {0xff2, 4097}};
 static int fake_rule_count = 2;
-static int rule_dumps;
 
 int rtnl_fwmark_rules(int family, rtnl_fwmark_rule_t *rules, int n) {
     int found = 0;
@@ -357,6 +363,7 @@ int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
     snprintf(mark, (size_t)mark_size, "%s", ru ? mark_ru : mark_hr);
     return RCI_MARK_OK;
 }
+#endif
 
 static inline void reset(void) {
     memset(restores, 0, sizeof(restores));

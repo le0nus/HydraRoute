@@ -350,7 +350,7 @@ static int resolve_mark(const unified_target_t *t, target_state_t *ts) {
             ts->warned = 0;
             return 0;
         }
-        r = RCI_MARK_ABSENT;        /* not a hex mark: like a policy without one */
+        r = RCI_MARK_TRANSPORT;     /* not a mark: no answer, the known one stays (Ruling 33) */
     }
     if (r != RCI_MARK_TRANSPORT && r != RCI_MARK_DENIED) {
         ts->gone = 1;

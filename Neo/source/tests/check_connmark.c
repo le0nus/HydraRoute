@@ -870,6 +870,14 @@ static void check_policy_mark_change(const unified_target_t *t, config_t *cfg) {
     assert(rci_calls == 1 && calls[0] == '\0');
     assert(warns == 1 && strstr(warn_log, "RCI denied reading policy HydraRoute"));
     rci_result_hr = RCI_MARK_OK;
+
+    /* RCI answers, but not with a mark: no answer either (Ruling 33). */
+    reset();
+    mark_hr = "zz";
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    assert(rci_calls == 1 && calls[0] == '\0');
+    assert(warns == 1 && strstr(warn_log, "RCI unreachable while reading policy HydraRoute"));
+    mark_hr = "ff3";
     assert_mangle(0, 1, 0xff3, 0);
     assert_mangle(1, 0, 0xff3, 0);
     assert_raw(0, 0xff3);

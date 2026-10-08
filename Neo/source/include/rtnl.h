@@ -16,10 +16,11 @@
 typedef int (*rtnl_msg_fn)(const struct nlmsghdr *h, void *ctx);
 
 /* Parses one datagram of a dump reply. Messages with another sequence number
- * are skipped. Returns RTNL_MORE until NLMSG_DONE with result 0; RTNL_FAIL on
+ * are skipped. Returns RTNL_MORE until NLMSG_DONE with result 0, and
+ * RTNL_DONE only once the rest of that datagram is checked too; RTNL_FAIL on
  * NLMSG_DONE with an error, NLMSG_ERROR other than an ACK, NLMSG_OVERRUN, an
- * interrupted dump (NLM_F_DUMP_INTR), a cut or broken message or a callback
- * error. */
+ * interrupted dump (NLM_F_DUMP_INTR), a cut or broken message, a message of
+ * the dump after its NLMSG_DONE, or a callback error. */
 int rtnl_parse(const void *buf, size_t len, uint32_t seq, rtnl_msg_fn fn, void *ctx);
 
 /* Dumps one rtnetlink table (RTM_GETRULE, RTM_GETROUTE) of a family on a
