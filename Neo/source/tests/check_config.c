@@ -187,12 +187,39 @@ static void check_raw_off_flag(void) {
     remove(HELP_PATH);
 }
 
+/* BlockedLogDelay uses set bit 32: a 32-bit set_mask would drop the CLI flag. */
+static void check_blocked_log_delay(void) {
+    config_t cfg;
+    write_conf("log=off\n");
+    assert(config_read(CONF_PATH, &cfg) == 0);
+    assert(cfg.blocked_log_delay == 30);
+    char *argv[] = {"hrneo", "--BlockedLogDelay", "5", NULL};
+    cli_args_t args;
+    assert(args_parse(3, argv, &args) == 0);
+    args_apply(&args, &cfg);
+    assert(cfg.blocked_log_delay == 5);
+    write_conf("BlockedLogDelay=60\n");
+    assert(config_read(CONF_PATH, &cfg) == 0);
+    assert(cfg.blocked_log_delay == 60);
+    remove(CONF_PATH);
+    for (int i = 0; i < PARAMS_COUNT; i++)
+        if (strcmp(PARAMS[i].config_key, "BlockedLogDelay") == 0) assert(PARAMS[i].set_bit == (1ull << 32));
+
+    capture_stdout(HELP_PATH, gen_defaults);
+    assert(file_has_line(GEN_PATH, "BlockedLogDelay=30"));
+    remove(GEN_PATH);
+    capture_stdout(HELP_PATH, help);
+    assert(file_has(HELP_PATH, "--BlockedLogDelay <seconds>"));
+    remove(HELP_PATH);
+}
+
 int main(void) {
     check_empty_geo_files_ignored();
     check_raw_guard();
     check_keep_ipset();
     check_set_bits();
     check_raw_off_flag();
+    check_blocked_log_delay();
     printf("check_config: OK\n");
     return 0;
 }

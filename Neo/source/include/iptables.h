@@ -32,6 +32,12 @@ int raw_guard_disable(void);
  * written), 3 gone from both families but the status file not saved (a new
  * run publishes it). */
 int raw_off_command(const char *lock_path);
+/* The mark of target index as the commits resolved it, for the monitor: 0
+ * while unknown (RCI not answered yet) and once the policy is gone. */
+uint32_t connmark_target_mark(int index);
+/* 1 once RCI said the policy of target index is gone (deleted in Keenetic):
+ * its rules left mangle and raw, until a mark comes back. */
+int connmark_target_gone(int index);
 void iptables_delete_rules_matching(const char *ipt_cmd, const char *chain,
                                     const char *needle1, const char *needle2);
 

@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <linux/fib_rules.h>
 #include <linux/rtnetlink.h>
 
@@ -31,6 +32,24 @@ static int open_fds, closes, sends, timeout_set;
 static int fail_socket, fail_bind, fail_setsockopt, fail_send;
 static int sent_type, sent_family;
 static uint32_t sent_seq;
+
+/* The clock (CLOCK_MONOTONIC, ms) moves only as the fake kernel takes time:
+ * datagram d comes dgram_delay[d] ms after recv asks for it, and a recv with
+ * nothing in time waits its whole SO_RCVTIMEO. Without a deadline every
+ * SO_RCVTIMEO is RTNL_TIMEOUT_MS (expect_1s); with one, each is kept. */
+static int64_t fake_ms = 100000;
+static int dgram_delay[MAX_DGRAMS];
+static int expect_1s = 1, clock_calls, recvs;
+static long rcvtimeo_us[16];            /* each SO_RCVTIMEO set, in order */
+static int rcvtimeo_n, fail_setsockopt_from;    /* the n-th and later setsockopt fail */
+
+int __wrap_clock_gettime(clockid_t id, struct timespec *ts) {
+    assert(id == CLOCK_MONOTONIC);
+    clock_calls++;
+    ts->tv_sec = (time_t)(fake_ms / 1000);
+    ts->tv_nsec = (long)(fake_ms % 1000) * 1000000L;
+    return 0;
+}
 
 static void patch_seq(void) {
     for (int d = 0; d < dgram_count; d++)
@@ -67,9 +86,14 @@ int __wrap_bind(int fd, const struct sockaddr *addr, socklen_t len) {
 
 int __wrap_setsockopt(int fd, int level, int name, const void *val, socklen_t len) {
     const struct timeval *tv = val;
+    long us = (long)tv->tv_sec * 1000000L + tv->tv_usec;
     assert(fd == FAKE_FD && level == SOL_SOCKET && name == SO_RCVTIMEO && len == sizeof(*tv));
-    assert(tv->tv_sec == 1 && tv->tv_usec == 0);
-    if (fail_setsockopt) {
+    assert(tv->tv_usec >= 0 && tv->tv_usec < 1000000L);
+    assert(us > 0 && us <= 1000000L);           /* 0 would mean no timeout at all */
+    if (expect_1s) assert(us == 1000000L);
+    assert(rcvtimeo_n < 16);
+    rcvtimeo_us[rcvtimeo_n++] = us;
+    if (fail_setsockopt || (fail_setsockopt_from && rcvtimeo_n >= fail_setsockopt_from)) {
         errno = ENOPROTOOPT;
         return -1;
     }
@@ -108,11 +132,15 @@ ssize_t __wrap_send(int fd, const void *buf, size_t len, int flags) {
 ssize_t __wrap_recv(int fd, void *buf, size_t len, int flags) {
     assert(fd == FAKE_FD && timeout_set);
     assert((flags & ~(MSG_TRUNC | MSG_PEEK)) == 0);
-    if (dgram_next == dgram_count) {
+    long wait_ms = rcvtimeo_us[rcvtimeo_n - 1] / 1000;
+    recvs++;
+    if (dgram_next == dgram_count || dgram_delay[dgram_next] > wait_ms) {
+        fake_ms += wait_ms;
         errno = EAGAIN;
         return -1;
     }
     int d = dgram_next;
+    fake_ms += dgram_delay[d];
     if (dgram_errno[d]) {
         dgram_next++;
         errno = dgram_errno[d];
@@ -127,8 +155,9 @@ ssize_t __wrap_recv(int fd, void *buf, size_t len, int flags) {
 static void script_reset(void) {
     memset(dgram_len, 0, sizeof(dgram_len));
     memset(dgram_errno, 0, sizeof(dgram_errno));
+    memset(dgram_delay, 0, sizeof(dgram_delay));
     dgram_count = dgram_next = 0;
-    closes = sends = 0;
+    closes = sends = recvs = rcvtimeo_n = 0;
 }
 
 static void put_msg(int d, uint16_t type, uint16_t flags, uint32_t seq, const void *payload, size_t plen) {
@@ -602,12 +631,386 @@ static void check_many(void) {
     assert(want[0].table == 4097 && want[1].table == 5129 && want[2].table == 0);
 }
 
+/* --- rtnl_default_routes ---------------------------------------------- */
+
+#define ROUTE_MAX 192
+
+/* A route as kernel 4.9 dumps it. IPv4 (fib_dump_info): the header holds
+ * the table, or RT_TABLE_COMPAT above 255; RTA_TABLE all of it; RTA_OIF
+ * only with a device, none for blackhole/unreachable/prohibit; a multipath
+ * route has RTA_MULTIPATH instead. IPv6 (rt6_fill_node): the header holds
+ * the low byte of the table, RTA_OIF always (lo for a reject route),
+ * RTA_PRIORITY always, and RTA_CACHEINFO and RTA_PREF, which say nothing
+ * here. */
+typedef struct {
+    uint8_t  family;            /* 0: AF_INET */
+    uint8_t  dst_len;
+    uint8_t  type;              /* 0: RTN_UNICAST */
+    uint32_t table;
+    uint32_t oif;               /* RTA_OIF when not 0 */
+    int      cloned;            /* RTM_F_CLONED: a cached clone */
+    int      no_table;          /* no RTA_TABLE, only the header */
+    int      hops;              /* RTA_MULTIPATH with this many nexthops (ifindex 7, 8, ...) */
+    uint16_t bad;               /* this u32 attribute (RTA_TABLE, RTA_OIF, RTA_PRIORITY) gets 2 bytes */
+    int      oif_zero;          /* RTA_OIF 0 */
+    int      trailer;           /* as rule_t */
+    int      mp_broken;         /* RTA_MULTIPATH: 1 empty; 2 rtnh_len < 8; 3 rtnh_len past the
+                                 * attribute; 4 a nexthop attribute cut; 5 ifindex 0; 6 bytes after
+                                 * the last nexthop that are none */
+} route_t;
+
+static size_t put_route_u32(uint8_t *p, size_t off, uint16_t type, uint32_t v, const route_t *r) {
+    return put_attr(p, off, type, &v, r->bad == type ? 2 : 4);
+}
+
+static size_t put_multipath(uint8_t *p, size_t off, const route_t *r) {
+    size_t alen = r->family == AF_INET6 ? 16 : 4, start = off;
+    struct rtattr *mp = (struct rtattr *)(p + off);
+    mp->rta_type = RTA_MULTIPATH;
+    off += RTA_LENGTH(0);
+    for (int h = 0; h < r->hops && r->mp_broken != 1; h++) {
+        struct rtnexthop *nh = (struct rtnexthop *)(p + off);
+        size_t hop = off;
+        memset(nh, 0, sizeof(*nh));
+        nh->rtnh_ifindex = r->mp_broken == 5 && h == 1 ? 0 : 7 + h;
+        off = put_attr(p, off + sizeof(*nh), RTA_GATEWAY, NULL, alen);
+        nh->rtnh_len = (unsigned short)(off - hop);
+        if (r->mp_broken == 2 && h == 0) nh->rtnh_len = 4;
+        if (r->mp_broken == 3 && h == r->hops - 1) nh->rtnh_len += 8;
+        if (r->mp_broken == 4 && h == 0) ((struct rtattr *)(p + hop + sizeof(*nh)))->rta_len += 4;
+    }
+    if (r->mp_broken == 6) {
+        memset(p + off, 0, 4);
+        off += 4;
+    }
+    mp->rta_len = (unsigned short)(off - start);
+    return off;
+}
+
+static size_t route_payload(uint8_t *p, const route_t *r) {
+    struct rtmsg *rt = (struct rtmsg *)p;
+    uint8_t family = r->family ? r->family : AF_INET;
+    size_t alen = family == AF_INET6 ? 16 : 4;
+    size_t off = NLMSG_ALIGN(sizeof(*rt));
+    memset(p, 0, ROUTE_MAX);
+    rt->rtm_family = family;
+    rt->rtm_dst_len = r->dst_len;
+    rt->rtm_type = r->type ? r->type : RTN_UNICAST;
+    if (family == AF_INET6) rt->rtm_table = (uint8_t)r->table;
+    else rt->rtm_table = r->table > 255 ? RT_TABLE_COMPAT : (uint8_t)r->table;
+    rt->rtm_protocol = RTPROT_STATIC;
+    rt->rtm_scope = RT_SCOPE_UNIVERSE;
+    rt->rtm_flags = r->cloned ? RTM_F_CLONED : 0;
+    if (!r->no_table) off = put_route_u32(p, off, RTA_TABLE, r->table, r);
+    if (r->dst_len) off = put_attr(p, off, RTA_DST, NULL, alen);
+    off = put_route_u32(p, off, RTA_PRIORITY, family == AF_INET6 ? 1024 : 100, r);
+    if (r->hops || r->mp_broken) {
+        off = put_multipath(p, off, r);
+        /* a valid attribute right after it, so a nexthop running past the
+         * multipath attribute would still parse */
+        if (r->mp_broken == 3) off = put_route_u32(p, off, RTA_FLOW, 0, r);
+    } else {
+        if (rt->rtm_type == RTN_UNICAST && r->oif) off = put_attr(p, off, RTA_GATEWAY, NULL, alen);
+        if (r->oif || r->oif_zero) off = put_route_u32(p, off, RTA_OIF, r->oif_zero ? 0 : r->oif, r);
+    }
+    if (family == AF_INET6) {
+        uint8_t pref = 0;
+        off = put_attr(p, off, RTA_CACHEINFO, NULL, sizeof(struct rta_cacheinfo));
+        off = put_attr(p, off, RTA_PREF, &pref, 1);
+    }
+    if (r->trailer) {
+        struct rtattr *a = (struct rtattr *)(p + off);
+        a->rta_len = r->trailer == 1 ? 2 : 64;
+        a->rta_type = RTA_FLOW;
+        off += 4;
+    }
+    assert(off <= ROUTE_MAX);
+    return off;
+}
+
+static void put_route(int d, uint32_t seq, route_t r) {
+    uint8_t p[ROUTE_MAX] __attribute__((aligned(4)));
+    put_msg(d, RTM_NEWROUTE, NLM_F_MULTI, seq, p, route_payload(p, &r));
+}
+
+static int st[8];
+
+/* Default route states of n tables; the states start as garbage. */
+static int defaults(int family, int n, const uint32_t *tables) {
+    for (int p = 0; p < 8; p++) st[p] = 0x5a5a;
+    int r = rtnl_default_routes(family, tables, n, st);
+    assert(open_fds == 0);              /* the socket is closed on every path */
+    return r;
+}
+
+static void check_default_routes(void) {
+    /* main, HydraRoute's table (4096, above 255: the header says
+     * RT_TABLE_COMPAT), a table with only a /24, a blackhole default, and a
+     * table 0 that matches nothing. A cached clone is skipped. Over two
+     * datagrams, in one dump of the family. */
+    static const uint32_t tables[5] = {RT_TABLE_MAIN, 4096, 4097, 4098, 0};
+    script_reset();
+    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    put_route(0, SEQ_REQ, (route_t){.dst_len = 24, .table = 4097, .oif = 9});
+    put_route(0, SEQ_REQ, (route_t){.table = 4096, .oif = 9});
+    put_route(1, SEQ_REQ, (route_t){.type = RTN_BLACKHOLE, .table = 4098});
+    put_route(1, SEQ_REQ, (route_t){.table = 4097, .oif = 9, .cloned = 1});
+    put_route(1, SEQ_REQ, (route_t){.type = RTN_LOCAL, .dst_len = 32, .table = RT_TABLE_LOCAL, .oif = 1});
+    put_done(1, SEQ_REQ, 0);
+    assert(defaults(AF_INET, 5, tables) == 0);
+    assert(sends == 1 && closes == 1);
+    assert(sent_type == RTM_GETROUTE && sent_family == AF_INET);
+    assert(st[0] == RTNL_ROUTE_UNICAST && st[1] == RTNL_ROUTE_UNICAST);
+    assert(st[2] == RTNL_ROUTE_NONE && st[3] == RTNL_ROUTE_OTHER && st[4] == RTNL_ROUTE_NONE);
+
+    /* Every kind of default. Only unicast through an interface is a path:
+     * unreachable, prohibit and a unicast default without a device are not;
+     * multipath is. A unicast default wins over a blackhole fallback of its
+     * table in either order. A route without RTA_TABLE has its table in the
+     * header. */
+    {
+        static const uint32_t kinds[8] = {RT_TABLE_MAIN, 4096, 4097, 4098, 4099, 4100, 4101, RT_TABLE_COMPAT};
+        script_reset();
+        put_route(0, SEQ_REQ, (route_t){.type = RTN_UNREACHABLE, .table = 4096});
+        put_route(0, SEQ_REQ, (route_t){.type = RTN_PROHIBIT, .table = 4097});
+        put_route(0, SEQ_REQ, (route_t){.table = 4098});
+        put_route(0, SEQ_REQ, (route_t){.table = 4099, .hops = 2});
+        put_route(0, SEQ_REQ, (route_t){.type = RTN_BLACKHOLE, .table = 4100});
+        put_route(0, SEQ_REQ, (route_t){.table = 4100, .oif = 9});
+        put_route(0, SEQ_REQ, (route_t){.table = 4101, .oif = 9});
+        put_route(0, SEQ_REQ, (route_t){.type = RTN_BLACKHOLE, .table = 4101});
+        put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5, .no_table = 1});
+        put_done(0, SEQ_REQ, 0);
+        assert(defaults(AF_INET, 8, kinds) == 0);
+        assert(st[0] == RTNL_ROUTE_UNICAST);
+        assert(st[1] == RTNL_ROUTE_OTHER && st[2] == RTNL_ROUTE_OTHER && st[3] == RTNL_ROUTE_OTHER);
+        assert(st[4] == RTNL_ROUTE_UNICAST && st[5] == RTNL_ROUTE_UNICAST && st[6] == RTNL_ROUTE_UNICAST);
+        assert(st[7] == RTNL_ROUTE_NONE);   /* the header of 4096..4101 says 252: not a table of its own */
+    }
+
+    /* IPv6 4.9: the header has the low byte of the table, so 4096 says 0 and
+     * 4350 says 254, main's id; only RTA_TABLE tells them apart. An empty
+     * table dumps its root, "unreachable default dev lo" of table 0 (unspec):
+     * not main's. */
+    {
+        static const uint32_t t6[4] = {RT_TABLE_MAIN, 4096, 4350, 0};
+        script_reset();
+        put_route(0, SEQ_REQ, (route_t){.family = AF_INET6, .type = RTN_UNREACHABLE, .table = 0, .oif = 1});
+        put_route(0, SEQ_REQ, (route_t){.family = AF_INET6, .table = 4096, .oif = 9});
+        put_route(0, SEQ_REQ, (route_t){.family = AF_INET6, .table = 4350, .oif = 9});
+        put_route(0, SEQ_REQ, (route_t){.family = AF_INET6, .dst_len = 64, .table = RT_TABLE_MAIN, .oif = 3});
+        put_route(0, SEQ_REQ, (route_t){.family = AF_INET6, .dst_len = 128, .table = RT_TABLE_MAIN,
+                                        .oif = 3, .cloned = 1});
+        put_done(0, SEQ_REQ, 0);
+        assert(defaults(AF_INET6, 4, t6) == 0);
+        assert(sent_type == RTM_GETROUTE && sent_family == AF_INET6);
+        assert(st[0] == RTNL_ROUTE_NONE && st[1] == RTNL_ROUTE_UNICAST);
+        assert(st[2] == RTNL_ROUTE_UNICAST && st[3] == RTNL_ROUTE_NONE);
+
+        /* A blackhole default in main is a default route (dev lo); a default
+         * via the uplink is a path. */
+        script_reset();
+        put_route(0, SEQ_REQ, (route_t){.family = AF_INET6, .type = RTN_BLACKHOLE, .table = RT_TABLE_MAIN, .oif = 1});
+        put_done(0, SEQ_REQ, 0);
+        assert(defaults(AF_INET6, 2, t6) == 0 && st[0] == RTNL_ROUTE_OTHER && st[1] == RTNL_ROUTE_NONE);
+        script_reset();
+        put_route(0, SEQ_REQ, (route_t){.family = AF_INET6, .table = RT_TABLE_MAIN, .oif = 3});
+        put_done(0, SEQ_REQ, 0);
+        assert(defaults(AF_INET6, 2, t6) == 0 && st[0] == RTNL_ROUTE_UNICAST);
+    }
+
+    /* No answer within RTNL_TIMEOUT_MS. */
+    script_reset();
+    assert(defaults(AF_INET, 5, tables) == -1);
+}
+
+/* A broken or failed route dump is -1 as a whole, whatever was found before
+ * it, and whether or not the broken route is a default of a table asked for. */
+static void check_routes_strict(void) {
+    static const uint32_t tables[2] = {RT_TABLE_MAIN, 4096};
+    static const struct {
+        const char *what;
+        route_t r;
+    } broken[] = {
+        {"IPv6 route in an IPv4 dump",   {.family = AF_INET6, .table = 4096, .oif = 9}},
+        {"RTA_TABLE of 2 bytes",         {.table = 4096, .oif = 9, .bad = RTA_TABLE}},
+        {"RTA_OIF of 2 bytes",           {.table = 4096, .oif = 9, .bad = RTA_OIF}},
+        {"RTA_PRIORITY of 2 bytes",      {.table = 4096, .oif = 9, .bad = RTA_PRIORITY}},
+        {"RTA_OIF 0",                    {.table = 4096, .oif_zero = 1}},
+        {"attribute shorter than itself", {.table = 4096, .oif = 9, .trailer = 1}},
+        {"attribute past the message",   {.table = 4096, .oif = 9, .trailer = 2}},
+        {"empty multipath",              {.table = 4096, .mp_broken = 1}},
+        {"nexthop shorter than itself",  {.table = 4096, .hops = 2, .mp_broken = 2}},
+        {"nexthop past the attribute",   {.table = 4096, .hops = 2, .mp_broken = 3}},
+        {"nexthop attribute cut",        {.table = 4096, .hops = 2, .mp_broken = 4}},
+        {"nexthop without interface",    {.table = 4096, .hops = 2, .mp_broken = 5}},
+        {"bytes after the last nexthop", {.table = 4096, .hops = 1, .mp_broken = 6}},
+        {"broken, not a default",        {.dst_len = 24, .table = 4097, .oif = 9, .bad = RTA_OIF}},
+        {"broken, another table",        {.table = 5000, .oif = 9, .trailer = 1}},
+    };
+    const int nb = (int)(sizeof(broken) / sizeof(broken[0]));
+    for (int c = 0; c < nb + 7; c++) {
+        script_reset();
+        /* found before the break: main and 4096 have a path */
+        put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+        put_route(0, SEQ_REQ, (route_t){.table = 4096, .oif = 9});
+        if (c < nb) {
+            put_route(0, SEQ_REQ, broken[c].r);
+        } else if (c == nb) {
+            uint8_t shortroute[8] = {AF_INET};          /* shorter than rtmsg */
+            put_msg(0, RTM_NEWROUTE, NLM_F_MULTI, SEQ_REQ, shortroute, sizeof(shortroute));
+        } else if (c == nb + 1) {
+            put_rule(0, SEQ_REQ, NDMS(0xff2, 4096));    /* a rule in a route dump */
+        } else if (c == nb + 2) {
+            put_error(0, SEQ_REQ, -EBUSY);
+        } else if (c == nb + 3) {
+            put_msg(0, NLMSG_OVERRUN, 0, SEQ_REQ, NULL, 0);
+        } else if (c == nb + 4) {
+            put_route(0, SEQ_REQ, (route_t){.table = 4097, .oif = 9});
+            last->nlmsg_flags |= NLM_F_DUMP_INTR;       /* the routes changed meanwhile */
+        } else if (c == nb + 5) {
+            put_done(0, SEQ_REQ, 0);                    /* bytes after the end */
+            dgram_len[0] += 8;
+        }
+        put_done(1, SEQ_REQ, c == nb + 6 ? -EMSGSIZE : 0);
+        if (defaults(AF_INET, 2, tables) != -1) {
+            fprintf(stderr, "check_rtnl: broken route dump %d (%s) taken as complete\n",
+                    c, c < nb ? broken[c].what : "envelope");
+            assert(0);
+        }
+    }
+
+    /* IPv6 the same: an IPv4 route, or a broken one, in an IPv6 dump. */
+    for (int c = 0; c < 2; c++) {
+        script_reset();
+        put_route(0, SEQ_REQ, (route_t){.family = AF_INET6, .table = RT_TABLE_MAIN, .oif = 3});
+        if (c == 0) put_route(0, SEQ_REQ, (route_t){.table = 4096, .oif = 9});
+        else put_route(0, SEQ_REQ, (route_t){.family = AF_INET6, .table = 4096, .oif = 9, .bad = RTA_TABLE});
+        put_done(0, SEQ_REQ, 0);
+        assert(defaults(AF_INET6, 2, tables) == -1);
+    }
+
+    /* The control: the same valid routes alone are a complete dump. */
+    script_reset();
+    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    put_route(0, SEQ_REQ, (route_t){.table = 4096, .oif = 9});
+    put_route(0, SEQ_REQ, (route_t){.table = 4097, .hops = 3});
+    put_done(1, SEQ_REQ, 0);
+    assert(defaults(AF_INET, 2, tables) == 0);
+    assert(st[0] == RTNL_ROUTE_UNICAST && st[1] == RTNL_ROUTE_UNICAST);
+}
+
+/* Ruling 15: one deadline for a monitor round. Each recv waits for what is
+ * left of it (1 s at most); a dump not done by then fails, at the deadline
+ * and not later; one asked for after it fails without a request. The clock
+ * is the fake's: nothing really waits. */
+static void check_deadline(void) {
+    static const uint32_t tables[2] = {RT_TABLE_MAIN, 4096};
+    expect_1s = 0;
+    fake_ms = 100000;
+    assert(rtnl_now_ms() == 100000);
+
+    /* Done in time: each wait is what is left. */
+    script_reset();
+    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    dgram_delay[0] = 50;
+    put_route(1, SEQ_REQ, (route_t){.table = 4096, .oif = 9});
+    put_done(1, SEQ_REQ, 0);
+    dgram_delay[1] = 30;
+    rtnl_set_deadline(100200);
+    assert(defaults(AF_INET, 2, tables) == 0);
+    assert(st[0] == RTNL_ROUTE_UNICAST && st[1] == RTNL_ROUTE_UNICAST);
+    assert(rcvtimeo_n == 2 && rcvtimeo_us[0] == 200000 && rcvtimeo_us[1] == 150000);
+    assert(fake_ms == 100080);
+
+    /* A multipart dump cut by the deadline: -1 when it comes. */
+    script_reset();
+    fake_ms = 100000;
+    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    dgram_delay[0] = 120;
+    put_route(1, SEQ_REQ, (route_t){.table = 4096, .oif = 9});
+    put_done(1, SEQ_REQ, 0);
+    dgram_delay[1] = 100;
+    assert(defaults(AF_INET, 2, tables) == -1);
+    assert(recvs == 2 && rcvtimeo_us[1] == 80000 && fake_ms == 100200 && closes == 1);
+
+    /* A part that comes just at the deadline, not the end: no more waiting. */
+    script_reset();
+    fake_ms = 100000;
+    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    dgram_delay[0] = 200;
+    put_done(1, SEQ_REQ, 0);
+    assert(defaults(AF_INET, 2, tables) == -1);
+    assert(recvs == 1 && fake_ms == 100200);
+
+    /* The end that comes just at the deadline counts: the dump is whole. */
+    script_reset();
+    fake_ms = 100000;
+    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    put_done(0, SEQ_REQ, 0);
+    dgram_delay[0] = 200;
+    assert(defaults(AF_INET, 2, tables) == 0 && st[0] == RTNL_ROUTE_UNICAST);
+
+    /* A signal: recv again, for what is left. */
+    script_reset();
+    fake_ms = 100000;
+    put_errno(0, EINTR);
+    dgram_delay[0] = 40;
+    put_route(1, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    put_done(1, SEQ_REQ, 0);
+    dgram_delay[1] = 10;
+    assert(defaults(AF_INET, 2, tables) == 0);
+    assert(rcvtimeo_n == 2 && rcvtimeo_us[1] == 160000);
+
+    /* The new wait cannot be set: the dump fails, the socket is closed. */
+    script_reset();
+    fake_ms = 100000;
+    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    put_done(1, SEQ_REQ, 0);
+    fail_setsockopt_from = 2;
+    assert(defaults(AF_INET, 2, tables) == -1 && closes == 1 && recvs == 1);
+    fail_setsockopt_from = 0;
+
+    /* Past the deadline: no socket, no request, for routes and rules. */
+    script_reset();
+    fake_ms = 100200;
+    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    put_done(0, SEQ_REQ, 0);
+    assert(defaults(AF_INET, 2, tables) == -1);
+    assert(lookup(AF_INET, 1, 0xff2, 0, 0) == -1);
+    assert(sends == 0 && closes == 0 && rcvtimeo_n == 0);
+
+    /* More than RTNL_TIMEOUT_MS left: a recv still waits 1 s at most. */
+    script_reset();
+    fake_ms = 100000;
+    rtnl_set_deadline(105000);
+    assert(defaults(AF_INET, 2, tables) == -1);
+    assert(rcvtimeo_n == 1 && rcvtimeo_us[0] == 1000000 && fake_ms == 101000);
+
+    /* No deadline again: 1 s per recv, and the clock is not read. */
+    rtnl_set_deadline(0);
+    expect_1s = 1;
+    clock_calls = 0;
+    script_reset();
+    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    put_done(1, SEQ_REQ, 0);
+    dgram_delay[1] = 900;
+    assert(defaults(AF_INET, 2, tables) == 0 && clock_calls == 0);
+    script_reset();
+    put_rule(0, SEQ_REQ, NDMS(0xff2, 4097));
+    put_done(0, SEQ_REQ, 0);
+    assert(lookup(AF_INET, 1, 0xff2, 0, 0) == 1 && clock_calls == 0);
+}
+
 int main(void) {
     check_parse();
     check_dump();
     check_profile();
     check_strict();
     check_many();
+    check_default_routes();
+    check_routes_strict();
+    check_deadline();
     puts("check_rtnl: OK");
     return 0;
 }

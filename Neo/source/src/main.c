@@ -16,6 +16,7 @@
 #include "../include/conntrack.h"
 #include "../include/geodat.h"
 #include "../include/guard_status.h"
+#include "../include/guard_monitor.h"
 #include "../include/routing.h"
 #include "../include/nflog_capture.h"
 #include "../include/l7_dispatch.h"
@@ -510,6 +511,9 @@ int main(int argc, char *argv[]) {
             LOG_INFO("  [%d] %s (policy)", i, g_all_sorted[i].pair.ipv4);
     }
 
+    /* §6.1: the policies whose path the monitor watches, by target index. */
+    guard_monitor_init(g_all_sorted, g_all_sorted_count, g_config.blocked_log_delay);
+
     g_policy_names_count = policy_count;
     for (int i = 0; i < policy_count; i++) {
         strncpy(g_policy_names[i], policy_names[i], 63);
@@ -651,6 +655,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    int monitor_fd = guard_monitor_start(epfd);
+
     wlapi_start(WATCHLIST_SOCKET, g_all_targets);
 
     LOG_INFO("Packet capture started, waiting for DNS responses...");
@@ -678,6 +684,8 @@ int main(int argc, char *argv[]) {
                 ssize_t r = read(reasm_gc_fd, &exp, sizeof(exp));
                 (void)r;
                 tcp_reasm_gc(&g_reasm);
+            } else if (monitor_fd >= 0 && events[i].data.fd == monitor_fd) {
+                guard_monitor_on_timer(monitor_fd);
             } else if (events[i].data.fd == signals.sig_fd) {
                 struct signalfd_siginfo si;
                 ssize_t s = read(signals.sig_fd, &si, sizeof(si));
@@ -699,6 +707,7 @@ int main(int argc, char *argv[]) {
 
     wlapi_stop();
     if (reasm_gc_fd >= 0) close(reasm_gc_fd);
+    if (monitor_fd >= 0) close(monitor_fd);
     close(epfd);
 
 cleanup_signals:

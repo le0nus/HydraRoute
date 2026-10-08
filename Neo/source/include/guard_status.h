@@ -28,4 +28,36 @@ void guard_status_set_rebuild(time_t when);
  * change is kept for the next flush, one WARN until a write works again. */
 int guard_status_flush(void);
 
+typedef enum {
+    PATH_NA,        /* family not tracked (IPv6 without any default route in main) */
+    PATH_OK,        /* unicast default route in the policy table: a path, not tunnel health */
+    PATH_BLOCKED,   /* no default route there, or not unicast */
+    PATH_UNKNOWN,   /* a dump failed, the policy has no fwmark rule, or its mark is unknown */
+} path_state_t;
+
+/* The policies the monitor watches: count of them, the k-th called name(k),
+ * a string of the target list that outlives the status (no copies). Their
+ * state is allocated here for exactly count entries, all unknown until a
+ * round reports; the old state goes. If it cannot be allocated: one WARN,
+ * and every policy is written as unknown. Returns 0, or -1 then. Lines go
+ * in the file as policy.<name>.v4= and .v6=, ok|blocked:<unix-time>|
+ * unknown|n/a, between raw_rules_v6 and last_rebuild. */
+int guard_status_policy_count(int count, const char *(*name)(int k));
+
+/* One monitor round for policy k. The worst tracked family decides
+ * (blocked > unknown > ok; n/a is not tracked): blocked for delay seconds ->
+ * WARN "guard: policy <name> blocked"; ok or n/a after that WARN -> WARN
+ * "guard: policy <name> restored after <N> s" (WARN, so log=off shows
+ * both). unknown neither ends nor restarts an episode, and a family that
+ * comes back blocked from unknown keeps the blocked:<unix-time> it had; only
+ * ok or n/a ends it. now_mono: CLOCK_MONOTONIC seconds; now_unix: wall time
+ * written as blocked:<t>. */
+void guard_status_policy(int k, path_state_t v4, path_state_t v6,
+                         long now_mono, time_t now_unix, int delay);
+
+/* Policy k is gone (RCI: deleted in Keenetic): its lines leave the file and
+ * its episode ends without "restored" (a WARN says it is gone if "blocked"
+ * was logged). A later round for it starts afresh. */
+void guard_status_policy_gone(int k);
+
 #endif

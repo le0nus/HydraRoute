@@ -96,6 +96,11 @@ const param_def_t PARAMS[] = {
       BIT(31), 0,            1,
       "<true|false>",            "Keep ipsets across restarts even with clearIPSet=true", "true"  },
 
+    { "BlockedLogDelay",      "--BlockedLogDelay",      PT_INT_POS,
+      offsetof(config_t, blocked_log_delay),      0,
+      BIT(32), 0,            30,
+      "<seconds>",               "Seconds a policy has no path before a WARN", "30"    },
+
     { "IpsetMaxElem",         "--IpsetMaxElem",         PT_INT_POS,
       offsetof(config_t, ipset_maxelem),          0,
       BIT(14), 0,            262144,

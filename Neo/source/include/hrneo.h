@@ -90,6 +90,7 @@ typedef struct {
     int conntrack_flush;
     int raw_guard;
     int keep_ipset_on_restart;
+    int blocked_log_delay;
     int ipset_maxelem;
     char geo_ip_files[MAX_GEO_FILES][MAX_PATH_LEN];
     int geo_ip_file_count;

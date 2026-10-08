@@ -106,6 +106,8 @@ static void check_start_and_migration(const unified_target_t *t, config_t *cfg) 
     assert(raw_jumps(1) == 0 && nf[1].guard_len == 0);
     assert(status_has("raw_guard=degraded:no-mark-v4"));
     assert(status_has("raw_rules_v4=0") && status_has("raw_rules_v6=0"));
+    assert(connmark_target_mark(0) == 0 && !connmark_target_gone(0));     /* unknown, not gone */
+    assert(connmark_target_mark(1) == 0 && !connmark_target_gone(1));
 
     /* Still down: both policies are asked again, the cause is a WARN only
      * once; the raw modules are not loaded again. */
@@ -905,6 +907,8 @@ static void check_policy_mark_change(const unified_target_t *t, config_t *cfg) {
     assert_raw_of(0, 1, 0);
     assert_raw_of(1, 1, 0);
     assert(nf[0].guard_len == 1 && nf[1].guard_len == 1);
+    assert(connmark_target_gone(1) && connmark_target_mark(1) == 0);
+    assert(!connmark_target_gone(0) && connmark_target_mark(0) == 0xff1);
 
     /* Policy back: its rules return. */
     reset();
@@ -917,6 +921,7 @@ static void check_policy_mark_change(const unified_target_t *t, config_t *cfg) {
     assert_mangle(1, 0, 0xff3, 0);
     assert_raw(0, 0xff3);
     assert_raw(1, 0xff3);
+    assert(!connmark_target_gone(1) && connmark_target_mark(1) == 0xff3);
 
     /* Recreated again (0xffa) before NDMS put in its new rule: the new mark
      * is used at once, and its missing rule is an episode of its own, with
@@ -1173,6 +1178,15 @@ static void check_raw_off(const unified_target_t *t, config_t *cfg) {
     assert_mangle_unchanged();
 }
 
+/* The monitor reads the marks the commits resolved, by target index, and
+ * tells an unknown mark (0, not gone) from a policy RCI found gone. */
+static void check_target_mark(void) {
+    assert(connmark_target_mark(0) == 0xff1 && !connmark_target_gone(0));
+    assert(connmark_target_mark(1) == 0xff2 && !connmark_target_gone(1));
+    assert(connmark_target_mark(-1) == 0 && connmark_target_mark(MAX_TARGETS) == 0);
+    assert(!connmark_target_gone(-1) && !connmark_target_gone(MAX_TARGETS));
+}
+
 static void check_cleanup(const unified_target_t *t, const config_t *cfg) {
     ipset_pair_t pairs[2] = {t[0].pair, t[1].pair};
 
@@ -1223,6 +1237,7 @@ int main(void) {
     check_policy_mark_change(t, &cfg);
     check_mark_change_failures(t, &cfg);
     check_raw_off(t, &cfg);
+    check_target_mark();
     check_cleanup(t, &cfg);
     puts("check_connmark: OK");
     return 0;

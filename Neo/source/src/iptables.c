@@ -841,6 +841,15 @@ static int raw_remove_all(int *removed, int *failed_fi) {
     return ret;
 }
 
+uint32_t connmark_target_mark(int index) {
+    if (index < 0 || index >= MAX_TARGETS || g_states[index].gone) return 0;
+    return g_states[index].mark;
+}
+
+int connmark_target_gone(int index) {
+    return index >= 0 && index < MAX_TARGETS && g_states[index].gone;
+}
+
 int raw_guard_remove(void) {
     int removed, failed_fi;
     return raw_remove_all(&removed, &failed_fi);

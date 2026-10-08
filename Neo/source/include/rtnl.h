@@ -26,8 +26,8 @@ int rtnl_parse(const void *buf, size_t len, uint32_t seq, rtnl_msg_fn fn, void *
 /* Dumps one rtnetlink table (RTM_GETRULE, RTM_GETROUTE) of a family on a
  * socket of its own, separate from the ipset and conntrack sockets, and feeds
  * every reply message to fn. Returns 0 after NLMSG_DONE, -1 on any error, on
- * a datagram larger than RTNL_BUF_SIZE, or when no datagram came for
- * RTNL_TIMEOUT_MS. */
+ * a datagram larger than RTNL_BUF_SIZE, when no datagram came for
+ * RTNL_TIMEOUT_MS, or when it was not done by the deadline (rtnl_set_deadline). */
 int rtnl_dump(uint16_t type, uint8_t family, rtnl_msg_fn fn, void *ctx);
 
 typedef struct {
@@ -43,5 +43,27 @@ typedef struct {
  * marks have a rule, or -1 if the dump failed or was broken anywhere; the
  * tables then mean nothing. */
 int rtnl_fwmark_rules(int family, rtnl_fwmark_rule_t *rules, int n);
+
+/* CLOCK_MONOTONIC in ms: the clock of rtnl_set_deadline. */
+int64_t rtnl_now_ms(void);
+
+/* A deadline on rtnl_now_ms() for the dumps that follow, 0 for none (the
+ * default). With one, a dump asked for once it has passed fails at once,
+ * without a request; each recv waits until the deadline at most (and
+ * RTNL_TIMEOUT_MS at most), and a dump not done when it comes fails. */
+void rtnl_set_deadline(int64_t deadline_ms);
+
+#define RTNL_ROUTE_NONE     0   /* no default route in the table */
+#define RTNL_ROUTE_UNICAST  1   /* default route through an interface */
+#define RTNL_ROUTE_OTHER    2   /* default blackhole, unreachable, prohibit, ... */
+
+/* State of the default route in each of tables[0..n-1] of the family, from
+ * one route dump (the table comes from RTA_TABLE, so ids above 255 work;
+ * cached clones are skipped; a table 0 matches nothing). A unicast default
+ * through an interface (RTA_OIF or RTA_MULTIPATH) wins over any other
+ * default of its table. Every route of the dump is checked, ours or not: a
+ * broken one fails the dump. Returns 0, or -1 if the dump failed or was
+ * broken anywhere; the states then mean nothing. */
+int rtnl_default_routes(int family, const uint32_t *tables, int n, int *state);
 
 #endif
