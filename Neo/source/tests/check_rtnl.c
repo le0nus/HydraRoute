@@ -39,9 +39,13 @@ static uint32_t sent_seq;
  * SO_RCVTIMEO is RTNL_TIMEOUT_MS (expect_1s); with one, each is kept. */
 static int64_t fake_ms = 100000;
 static int dgram_delay[MAX_DGRAMS];
+static int dgram_late;                  /* kernel rounding: an answer may come this much after
+                                         * SO_RCVTIMEO and still be returned */
+static int send_delay, bind_delay;      /* ms the request takes (rtnl_lock), and bind */
 static int expect_1s = 1, clock_calls, recvs;
 static long rcvtimeo_us[16];            /* each SO_RCVTIMEO set, in order */
-static int rcvtimeo_n, fail_setsockopt_from;    /* the n-th and later setsockopt fail */
+static long sndtimeo_us;                /* SO_SNDTIMEO of this socket, 0 none */
+static int rcvtimeo_n, setsockopts, fail_setsockopt_from;   /* the n-th and later setsockopt fail */
 
 int __wrap_clock_gettime(clockid_t id, struct timespec *ts) {
     assert(id == CLOCK_MONOTONIC);
@@ -70,6 +74,7 @@ int __wrap_socket(int domain, int type, int protocol) {
     }
     open_fds++;
     timeout_set = 0;
+    sndtimeo_us = 0;
     return FAKE_FD;
 }
 
@@ -77,6 +82,7 @@ int __wrap_bind(int fd, const struct sockaddr *addr, socklen_t len) {
     const struct sockaddr_nl *sa = (const struct sockaddr_nl *)addr;
     assert(fd == FAKE_FD && len == sizeof(*sa));
     assert(sa->nl_family == AF_NETLINK && sa->nl_pid == 0 && sa->nl_groups == 0);
+    fake_ms += bind_delay;
     if (fail_bind) {
         errno = EADDRINUSE;
         return -1;
@@ -87,16 +93,22 @@ int __wrap_bind(int fd, const struct sockaddr *addr, socklen_t len) {
 int __wrap_setsockopt(int fd, int level, int name, const void *val, socklen_t len) {
     const struct timeval *tv = val;
     long us = (long)tv->tv_sec * 1000000L + tv->tv_usec;
-    assert(fd == FAKE_FD && level == SOL_SOCKET && name == SO_RCVTIMEO && len == sizeof(*tv));
+    assert(fd == FAKE_FD && level == SOL_SOCKET && len == sizeof(*tv));
+    assert(name == SO_RCVTIMEO || name == SO_SNDTIMEO);
     assert(tv->tv_usec >= 0 && tv->tv_usec < 1000000L);
     assert(us > 0 && us <= 1000000L);           /* 0 would mean no timeout at all */
-    if (expect_1s) assert(us == 1000000L);
-    assert(rcvtimeo_n < 16);
-    rcvtimeo_us[rcvtimeo_n++] = us;
-    if (fail_setsockopt || (fail_setsockopt_from && rcvtimeo_n >= fail_setsockopt_from)) {
+    if (expect_1s) assert(us == 1000000L && name == SO_RCVTIMEO);   /* Task 3's dump, as it was */
+    setsockopts++;
+    if (fail_setsockopt || (fail_setsockopt_from && setsockopts >= fail_setsockopt_from)) {
         errno = ENOPROTOOPT;
         return -1;
     }
+    if (name == SO_SNDTIMEO) {
+        sndtimeo_us = us;
+        return 0;
+    }
+    assert(rcvtimeo_n < 16);
+    rcvtimeo_us[rcvtimeo_n++] = us;
     timeout_set = 1;
     return 0;
 }
@@ -111,13 +123,19 @@ int __wrap_close(int fd) {
 /* The request: a dump of one table of one family, nothing else. */
 ssize_t __wrap_send(int fd, const void *buf, size_t len, int flags) {
     const struct nlmsghdr *h = buf;
-    assert(fd == FAKE_FD && timeout_set && flags == 0);
+    assert(fd == FAKE_FD && (timeout_set || sndtimeo_us) && flags == 0);
     assert(len == NLMSG_LENGTH(sizeof(struct rtmsg)) && h->nlmsg_len == len);
     assert(h->nlmsg_flags == (NLM_F_REQUEST | NLM_F_DUMP));
     sends++;
     sent_type = h->nlmsg_type;
     sent_seq = h->nlmsg_seq;
     sent_family = ((const struct rtmsg *)NLMSG_DATA(h))->rtm_family;
+    if (sndtimeo_us && send_delay > sndtimeo_us / 1000) {
+        fake_ms += sndtimeo_us / 1000;          /* SO_SNDTIMEO expired */
+        errno = EAGAIN;
+        return -1;
+    }
+    fake_ms += send_delay;
     if (fail_send) {
         errno = ECONNREFUSED;
         return -1;
@@ -134,7 +152,7 @@ ssize_t __wrap_recv(int fd, void *buf, size_t len, int flags) {
     assert((flags & ~(MSG_TRUNC | MSG_PEEK)) == 0);
     long wait_ms = rcvtimeo_us[rcvtimeo_n - 1] / 1000;
     recvs++;
-    if (dgram_next == dgram_count || dgram_delay[dgram_next] > wait_ms) {
+    if (dgram_next == dgram_count || dgram_delay[dgram_next] > wait_ms + dgram_late) {
         fake_ms += wait_ms;
         errno = EAGAIN;
         return -1;
@@ -157,7 +175,8 @@ static void script_reset(void) {
     memset(dgram_errno, 0, sizeof(dgram_errno));
     memset(dgram_delay, 0, sizeof(dgram_delay));
     dgram_count = dgram_next = 0;
-    closes = sends = recvs = rcvtimeo_n = 0;
+    closes = sends = recvs = rcvtimeo_n = setsockopts = 0;
+    dgram_late = send_delay = bind_delay = 0;
 }
 
 static void put_msg(int d, uint16_t type, uint16_t flags, uint32_t seq, const void *payload, size_t plen) {
@@ -921,7 +940,7 @@ static void check_deadline(void) {
     assert(defaults(AF_INET, 2, tables) == 0);
     assert(st[0] == RTNL_ROUTE_UNICAST && st[1] == RTNL_ROUTE_UNICAST);
     assert(rcvtimeo_n == 2 && rcvtimeo_us[0] == 200000 && rcvtimeo_us[1] == 150000);
-    assert(fake_ms == 100080);
+    assert(sndtimeo_us == 200000 && fake_ms == 100080);
 
     /* A multipart dump cut by the deadline: -1 when it comes. */
     script_reset();
@@ -943,13 +962,66 @@ static void check_deadline(void) {
     assert(defaults(AF_INET, 2, tables) == -1);
     assert(recvs == 1 && fake_ms == 100200);
 
-    /* The end that comes just at the deadline counts: the dump is whole. */
+    /* A whole answer counts only before the deadline (Ruling 39): at it, or
+     * later by the kernel's rounding of SO_RCVTIMEO, it is not published. */
     script_reset();
     fake_ms = 100000;
     put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
     put_done(0, SEQ_REQ, 0);
-    dgram_delay[0] = 200;
+    dgram_delay[0] = 199;
     assert(defaults(AF_INET, 2, tables) == 0 && st[0] == RTNL_ROUTE_UNICAST);
+    for (int late = 0; late < 2; late++) {
+        script_reset();
+        fake_ms = 100000;
+        put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+        put_done(0, SEQ_REQ, 0);
+        dgram_delay[0] = late ? 203 : 200;
+        dgram_late = 5;
+        assert(defaults(AF_INET, 2, tables) == -1);
+        assert(recvs == 1 && fake_ms == (late ? 100203 : 100200) && closes == 1);
+    }
+    script_reset();
+    fake_ms = 100000;
+    put_rule(0, SEQ_REQ, NDMS(0xff2, 4097));
+    put_done(0, SEQ_REQ, 0);
+    dgram_delay[0] = 203;
+    dgram_late = 5;
+    assert(lookup(AF_INET, 1, 0xff2, 0, 0) == -1);
+
+    /* The request itself takes time (rtnl_lock): the first recv waits only
+     * for what is left after it, and the send is bounded too. */
+    script_reset();
+    fake_ms = 100000;
+    send_delay = 150;
+    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    put_done(0, SEQ_REQ, 0);
+    dgram_delay[0] = 30;
+    assert(defaults(AF_INET, 2, tables) == 0);
+    assert(sndtimeo_us == 200000 && rcvtimeo_n == 1 && rcvtimeo_us[0] == 50000 && fake_ms == 100180);
+    script_reset();
+    fake_ms = 100000;
+    send_delay = 150;
+    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    put_done(0, SEQ_REQ, 0);
+    dgram_delay[0] = 60;
+    assert(defaults(AF_INET, 2, tables) == -1);
+    assert(rcvtimeo_us[0] == 50000 && fake_ms == 100200 && closes == 1);
+    script_reset();
+    fake_ms = 100000;
+    send_delay = 250;                       /* SO_SNDTIMEO expires */
+    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    put_done(0, SEQ_REQ, 0);
+    assert(defaults(AF_INET, 2, tables) == -1);
+    assert(sends == 1 && recvs == 0 && fake_ms == 100200 && closes == 1);
+
+    /* The deadline runs out before the request: nothing is sent. */
+    script_reset();
+    fake_ms = 100000;
+    bind_delay = 200;
+    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+    put_done(0, SEQ_REQ, 0);
+    assert(defaults(AF_INET, 2, tables) == -1);
+    assert(sends == 0 && recvs == 0 && closes == 1);
 
     /* A signal: recv again, for what is left. */
     script_reset();
@@ -962,14 +1034,18 @@ static void check_deadline(void) {
     assert(defaults(AF_INET, 2, tables) == 0);
     assert(rcvtimeo_n == 2 && rcvtimeo_us[1] == 160000);
 
-    /* The new wait cannot be set: the dump fails, the socket is closed. */
-    script_reset();
-    fake_ms = 100000;
-    put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
-    put_done(1, SEQ_REQ, 0);
-    fail_setsockopt_from = 2;
-    assert(defaults(AF_INET, 2, tables) == -1 && closes == 1 && recvs == 1);
-    fail_setsockopt_from = 0;
+    /* A wait that cannot be set fails the dump and closes the socket: the
+     * send's (1st setsockopt), the first recv's (2nd), a later one (3rd). */
+    for (int at = 1; at <= 3; at++) {
+        script_reset();
+        fake_ms = 100000;
+        put_route(0, SEQ_REQ, (route_t){.table = RT_TABLE_MAIN, .oif = 5});
+        put_done(1, SEQ_REQ, 0);
+        fail_setsockopt_from = at;
+        assert(defaults(AF_INET, 2, tables) == -1 && closes == 1);
+        assert(sends == (at > 1) && recvs == (at > 2));
+        fail_setsockopt_from = 0;
+    }
 
     /* Past the deadline: no socket, no request, for routes and rules. */
     script_reset();

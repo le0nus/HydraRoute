@@ -21,9 +21,11 @@
  * The fwmark rule of RU points to table 4096, HydraRoute's to 4097; the
  * default route state of main and of those two tables is scripted. Each
  * dump costs dump_cost ms of the fake clock and, as rtnl_dump does under a
- * deadline, fails once it has passed (none asked) or is cut when it comes. */
+ * deadline, fails once it has passed (none asked) or when it ends at or
+ * after it: cut by the recv timeout at the deadline, or, late_ms > 0, a
+ * whole answer that came that late (Ruling 39: not published). */
 static int64_t now_ms;
-static int64_t dump_cost;
+static int64_t dump_cost, late_ms;
 static int64_t deadline, deadline_log[16];
 static int deadline_n;
 static int rules_fail[2], routes_fail[2], rule_dumps[2], route_dumps[2];
@@ -41,7 +43,7 @@ static void kernel_reset(void) {
     }
     main_state[0] = RTNL_ROUTE_UNICAST;
     main_state[1] = RTNL_ROUTE_NONE;        /* no IPv6 uplink */
-    dump_cost = 0;
+    dump_cost = late_ms = 0;
 }
 
 static void counters_reset(void) {
@@ -63,8 +65,8 @@ void rtnl_set_deadline(int64_t d) {
 static int spend(void) {
     if (deadline && now_ms >= deadline) return -1;
     now_ms += dump_cost;
-    if (deadline && now_ms > deadline) {
-        now_ms = deadline;
+    if (deadline && now_ms >= deadline) {
+        now_ms = deadline + late_ms;
         return -1;
     }
     return 0;
@@ -553,6 +555,55 @@ static void check_overrun(void) {
     tick();
 }
 
+/* Ruling 39: a whole answer that comes at or after the deadline is not
+ * published. The family is unknown, an open blocked episode keeps its start
+ * (in the log and in the file), and the next round is skipped. */
+static void check_late_answer(void) {
+    now_ms = 2500000;
+    restart(30);
+    tick();
+    table_state[0][1] = RTNL_ROUTE_NONE;
+    tick();
+    int64_t t0 = now_ms;
+    has_line("HydraRoute", 0, blocked_since(t0));
+    int w = warns;
+
+    /* The IPv4 route dump's answer, whole, ends 3 ms after the deadline;
+     * a 100 ms dump that ends just at it is no better. */
+    for (int at = 0; at < 2; at++) {
+        dump_cost = at ? 100 : 150;
+        late_ms = at ? 0 : 3;
+        counters_reset();
+        tick();
+        int64_t start = deadline_log[0] - GUARD_MONITOR_DEADLINE_MS;
+        assert(now_ms == start + GUARD_MONITOR_DEADLINE_MS + late_ms);
+        assert(rule_dumps[0] == 1 && route_dumps[0] == 1 && route_dumps[1] == 0);
+        has_line("HydraRoute", 0, "unknown");
+        has_line("RU", 0, "unknown");
+        assert(warns == w + 1 && strstr(last_warn, "200 ms deadline"));
+        counters_reset();
+        tick();                             /* skipped */
+        assert(rule_dumps[0] == 0);
+        if (at == 0) {
+            dump_cost = late_ms = 0;
+            tick();                         /* t0 + 30 s: the WARN counts from t0 */
+            has_line("HydraRoute", 0, blocked_since(t0));
+            assert(warns == w + 2 && strstr(last_warn, "guard: policy HydraRoute blocked"));
+            w = warns;
+        }
+    }
+    dump_cost = late_ms = 0;
+    tick();
+    has_line("HydraRoute", 0, blocked_since(t0));
+    table_state[0][1] = RTNL_ROUTE_UNICAST;
+    tick();
+    {
+        char want[64];
+        snprintf(want, sizeof(want), "restored after %ld s", (long)((now_ms - t0) / 1000));
+        assert(strstr(last_warn, want));
+    }
+}
+
 /* A restarted hrneo knows nothing of the last one's episodes: no false
  * "restored", and a new episode counts from its own first round. */
 static void check_restart(void) {
@@ -655,6 +706,7 @@ int main(void) {
     check_family();
     check_rounds();
     check_overrun();
+    check_late_answer();
     check_restart();
     check_start();
     remove(STATUS);

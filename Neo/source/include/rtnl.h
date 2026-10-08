@@ -49,8 +49,11 @@ int64_t rtnl_now_ms(void);
 
 /* A deadline on rtnl_now_ms() for the dumps that follow, 0 for none (the
  * default). With one, a dump asked for once it has passed fails at once,
- * without a request; each recv waits until the deadline at most (and
- * RTNL_TIMEOUT_MS at most), and a dump not done when it comes fails. */
+ * without a request; the send and each recv wait only for what is left of
+ * it (and RTNL_TIMEOUT_MS at most), worked out just before the call; and a
+ * dump fails unless its whole answer was read before the deadline: a late
+ * one is not returned. A kernel mutex the request waits on (rtnl_lock) is
+ * not bounded by it. */
 void rtnl_set_deadline(int64_t deadline_ms);
 
 #define RTNL_ROUTE_NONE     0   /* no default route in the table */

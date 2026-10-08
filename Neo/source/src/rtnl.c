@@ -34,12 +34,19 @@ static int64_t wait_ms(void) {
     return left < RTNL_TIMEOUT_MS ? left : RTNL_TIMEOUT_MS;
 }
 
-/* SO_RCVTIMEO; ms > 0, since 0 would mean no timeout at all. */
-static int set_wait(int fd, int64_t ms) {
+/* SO_RCVTIMEO or SO_SNDTIMEO; ms > 0, since 0 would mean no timeout at all. */
+static int set_wait(int fd, int name, int64_t ms) {
     struct timeval tv;
     tv.tv_sec = (time_t)(ms / 1000);
     tv.tv_usec = (suseconds_t)(ms % 1000) * 1000;
-    return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return setsockopt(fd, SOL_SOCKET, name, &tv, sizeof(tv));
+}
+
+/* Under a deadline, the next send or recv may wait only for what is left
+ * of it, worked out just before the call; -1 once nothing is left. */
+static int keep_deadline(int fd, int name) {
+    int64_t wait = wait_ms();
+    return wait > 0 && set_wait(fd, name, wait) == 0 ? 0 : -1;
 }
 
 /* One message of our request. */
@@ -89,15 +96,20 @@ int rtnl_parse(const void *buf, size_t len, uint32_t seq, rtnl_msg_fn fn, void *
 }
 
 int rtnl_dump(uint16_t type, uint8_t family, rtnl_msg_fn fn, void *ctx) {
-    int64_t wait = wait_ms();
-    if (wait == 0) return -1;               /* past the deadline: nothing is asked */
+    if (g_deadline_ms && wait_ms() == 0) return -1;     /* past the deadline: nothing is asked */
     int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
     if (fd < 0) return -1;
 
+    /* Without a deadline every recv may wait RTNL_TIMEOUT_MS. With one
+     * (Ruling 39) the send waits only for what is left, and so does each
+     * recv, the first included; a kernel mutex the request waits on cannot
+     * be bounded from here. */
     struct sockaddr_nl sa;
     memset(&sa, 0, sizeof(sa));
     sa.nl_family = AF_NETLINK;
-    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0 || set_wait(fd, wait) != 0) {
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0 ||
+        (g_deadline_ms ? keep_deadline(fd, SO_SNDTIMEO)
+                       : set_wait(fd, SO_RCVTIMEO, RTNL_TIMEOUT_MS)) != 0) {
         close(fd);
         return -1;
     }
@@ -124,6 +136,7 @@ int rtnl_dump(uint16_t type, uint8_t family, rtnl_msg_fn fn, void *ctx) {
     uint32_t buf[RTNL_BUF_SIZE / 4];
     int ret = -1;
     for (;;) {
+        if (g_deadline_ms && keep_deadline(fd, SO_RCVTIMEO) != 0) break;
         ssize_t n = recv(fd, buf, sizeof(buf), MSG_TRUNC);
         int st = RTNL_MORE;                 /* EINTR: recv again */
         if (n < 0 && errno != EINTR) break;
@@ -131,13 +144,13 @@ int rtnl_dump(uint16_t type, uint8_t family, rtnl_msg_fn fn, void *ctx) {
             if ((size_t)n > sizeof(buf)) break;
             st = rtnl_parse(buf, (size_t)n, req.h.nlmsg_seq, fn, ctx);
         }
+        /* Read at or after the deadline, even a whole answer is too late:
+         * it is not published (Ruling 39). */
+        if (g_deadline_ms && wait_ms() == 0) break;
         if (st != RTNL_MORE) {
             ret = st == RTNL_DONE ? 0 : -1;
             break;
         }
-        /* A dump not done by the deadline fails; until then each recv waits
-         * only for what is left of it. */
-        if (g_deadline_ms && ((wait = wait_ms()) == 0 || set_wait(fd, wait) != 0)) break;
     }
     close(fd);
     return ret;
