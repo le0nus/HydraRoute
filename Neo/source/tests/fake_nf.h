@@ -6,12 +6,14 @@
 #include "../include/iptables.h"
 #include "../include/guard.h"
 #include "../include/guard_status.h"
+#include "../include/rtnl.h"
 #include "../include/util.h"
 #include <assert.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 
 #define MAX_LINES 64
 #define LINE_LEN  320
@@ -323,6 +325,30 @@ int __wrap_proc_list_has(const char *path, const char *name) {
     return raw_listed[fi];
 }
 
+/* The NDMS ip rules of IPv4, "fwmark <mark> lookup <table>": RU (0xff1) and
+ * HydraRoute (0xff2). fake_rule_count -1: the dump fails. As the real one,
+ * every table is set, 0 for a mark without a rule. */
+static rtnl_fwmark_rule_t fake_rules[8] = {{0xff1, 4096}, {0xff2, 4097}};
+static int fake_rule_count = 2;
+static int rule_dumps;
+
+int rtnl_fwmark_rules(int family, rtnl_fwmark_rule_t *rules, int n) {
+    int found = 0;
+    assert(family == AF_INET);              /* the policy mark is the same in both families */
+    rule_dumps++;
+    if (fake_rule_count < 0) return -1;
+    for (int k = 0; k < n; k++) {
+        rules[k].table = 0;
+        for (int j = 0; j < fake_rule_count && rules[k].mark; j++)
+            if (fake_rules[j].mark == rules[k].mark) {
+                rules[k].table = fake_rules[j].table;
+                break;
+            }
+        if (rules[k].table) found++;
+    }
+    return found;
+}
+
 int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
     int ru = strcmp(name, "RU") == 0;
     int r = rci_result != RCI_MARK_OK ? rci_result : ru ? rci_result_ru : rci_result_hr;
@@ -337,7 +363,7 @@ static inline void reset(void) {
     calls[0] = '\0';
     warn_log[0] = '\0';
     error_log[0] = '\0';
-    dumps = rci_calls = warns = errors = kmod_calls = 0;
+    dumps = rci_calls = warns = errors = kmod_calls = rule_dumps = 0;
     raw_kmod_calls[0] = raw_kmod_calls[1] = 0;
     mangle_dumps[0] = mangle_dumps[1] = 0;
     proc_calls = 0;

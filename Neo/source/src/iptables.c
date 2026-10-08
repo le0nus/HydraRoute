@@ -3,19 +3,22 @@
 #include "../include/guard_status.h"
 #include "../include/l7_firewall.h"
 #include "../include/log.h"
+#include "../include/rtnl.h"
 #include "../include/util.h"
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 
 /* main.c builds the target list once, so target i keeps its index, and its
  * state here, for the life of the process. */
 typedef struct {
     uint32_t mark;          /* mark of the target's rules, 0 while unknown */
-    int  gone;              /* RCI: the policy has no mark, its rules go */
+    uint8_t  gone;          /* RCI: the policy has no mark, its rules go */
+    uint8_t  rule_warned;   /* WARN about its missing NDMS ip rule logged */
     int  warned, warned_r;
 } target_state_t;
 
@@ -341,6 +344,7 @@ static int resolve_mark(const unified_target_t *t, target_state_t *ts) {
             if (ts->mark && ts->mark != (uint32_t)v)
                 LOG_WARN("Policy %s mark changed: 0x%x -> 0x%x, replacing its rules",
                          t->pair.ipv4, ts->mark, (uint32_t)v);
+            if (ts->mark != (uint32_t)v) ts->rule_warned = 0;  /* its rule: a new episode */
             ts->mark = (uint32_t)v;
             ts->gone = 0;
             ts->warned = 0;
@@ -368,6 +372,42 @@ static int resolve_mark(const unified_target_t *t, target_state_t *ts) {
         LOG_WARN("Policy %s has no mark ID yet", t->pair.ipv4);
     }
     return -1;
+}
+
+/* §4.4: NDMS keeps "fwmark <mark> lookup <table>" for every policy, so a
+ * policy recreated in Keenetic (new mark) or deleted shows as the rule of
+ * its known mark gone; recheck[i] then asks RCI for target i again. One
+ * IPv4 dump covers all: a policy has one mark for both families. A dump
+ * that failed tells nothing, so nothing is asked or removed over it. */
+static void check_policy_rules(const unified_target_t *targets, int count, uint8_t *recheck) {
+    static int warned_dump;
+    rtnl_fwmark_rule_t rules[MAX_TARGETS];
+    int any = 0;
+    for (int i = 0; i < count; i++) {
+        rules[i].mark = targets[i].is_interface ? 0 : g_states[i].mark;
+        if (rules[i].mark) any = 1;
+    }
+    if (!any) return;
+    if (rtnl_fwmark_rules(AF_INET, rules, count) < 0) {
+        if (!warned_dump)
+            LOG_WARN("ip rule dump failed: a policy recreated in Keenetic goes unnoticed meanwhile");
+        warned_dump = 1;
+        return;
+    }
+    warned_dump = 0;
+    for (int i = 0; i < count; i++) {
+        target_state_t *ts = &g_states[i];
+        if (!rules[i].mark) continue;
+        if (rules[i].table) {
+            ts->rule_warned = 0;
+            continue;
+        }
+        if (!ts->rule_warned)
+            LOG_WARN("Policy %s: no ip rule for fwmark 0x%x, reading its mark again",
+                     targets[i].pair.ipv4, ts->mark);
+        ts->rule_warned = 1;
+        recheck[i] = 1;
+    }
 }
 
 /* Sends the batch as one iptables-restore --noflush, which swaps the table in
@@ -767,8 +807,10 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
     const set_list_t sets = {(const char *)&targets->pair, sizeof(*targets), count};
     owned_index_t own;
     family_result_t res[2];
+    uint8_t recheck[MAX_TARGETS];
     int incomplete = 0;
 
+    memset(recheck, 0, sizeof(recheck));
     memset(res, 0, sizeof(res));
     res[0].raw_rules = res[1].raw_rules = -1;
 
@@ -785,9 +827,10 @@ int apply_unified_connmark_rules(const unified_target_t *targets, int count,
 
     /* RCI before the dumps keeps the dump -> restore gap short: NDMS may
      * rewrite the table in between, and the restore then fails. */
+    if (!startup_audit) check_policy_rules(targets, count, recheck);
     for (int i = 0; i < count; i++) {
         target_state_t *ts = &g_states[i];
-        if ((startup_audit || !ts->mark) && resolve_mark(&targets[i], ts) != 0)
+        if ((startup_audit || !ts->mark || recheck[i]) && resolve_mark(&targets[i], ts) != 0)
             incomplete = 1;
     }
 

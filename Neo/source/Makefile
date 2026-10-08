@@ -31,7 +31,7 @@ LDFLAGS_DYNAMIC = $(COMMON_LDFLAGS)
 
 LIBS =
 
-SRCS = src/main.c src/util.c src/log.c src/config.c src/args.c src/params.c src/watchlist.c src/ipset_nl.c src/dns.c src/packet_capture.c src/iptables.c src/guard.c src/guard_status.c src/signal_handler.c src/commit_sched.c src/rci.c src/conntrack.c src/geodat.c src/routing.c src/probe_tls.c src/probe_http.c src/probe_quic.c src/quic_crypto.c src/bogon.c src/nflog_capture.c src/l7_dispatch.c src/l7_firewall.c src/tcp_reasm.c src/watchlist_api.c
+SRCS = src/main.c src/util.c src/log.c src/config.c src/args.c src/params.c src/watchlist.c src/ipset_nl.c src/dns.c src/packet_capture.c src/iptables.c src/guard.c src/guard_status.c src/rtnl.c src/signal_handler.c src/commit_sched.c src/rci.c src/conntrack.c src/geodat.c src/routing.c src/probe_tls.c src/probe_http.c src/probe_quic.c src/quic_crypto.c src/bogon.c src/nflog_capture.c src/l7_dispatch.c src/l7_firewall.c src/tcp_reasm.c src/watchlist_api.c
 
 .PHONY: all clean mipsel mips aarch64 native check
 
@@ -91,6 +91,8 @@ check:
 	./build/check_raw_start
 	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=log_write,--wrap=fwrite,--wrap=fclose,--wrap=rename tests/check_guard_status.c src/guard_status.c src/log.c src/util.c -o build/check_guard_status
 	./build/check_guard_status
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=socket,--wrap=bind,--wrap=setsockopt,--wrap=send,--wrap=recv,--wrap=close tests/check_rtnl.c src/rtnl.c -o build/check_rtnl
+	./build/check_rtnl
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_rci.c src/util.c src/log.c src/config.c src/params.c -o build/check_rci
 	./build/check_rci
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_config.c src/config.c src/params.c src/args.c src/util.c src/log.c -o build/check_config
