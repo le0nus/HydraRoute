@@ -109,7 +109,7 @@ check:
 	./build/check_wlapi
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_routing.c src/routing.c src/watchlist.c src/util.c src/log.c -o build/check_routing
 	./build/check_routing
-	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=ipset_refresh_set_list,--wrap=ipset_add_batch,--wrap=log_write tests/check_cidr_load.c src/geodat.c src/ipset_nl.c src/util.c src/log.c -o build/check_cidr_load
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=ipset_refresh_set_list,--wrap=ipset_add_batch,--wrap=log_write,--wrap=malloc,--wrap=realloc tests/check_cidr_load.c src/geodat.c src/ipset_nl.c src/util.c src/log.c -o build/check_cidr_load
 	./build/check_cidr_load
 	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=send,--wrap=recv,--wrap=realloc,--wrap=log_write tests/check_ipset_refresh.c src/ipset_nl.c src/util.c src/log.c -o build/check_ipset_refresh
 	./build/check_ipset_refresh

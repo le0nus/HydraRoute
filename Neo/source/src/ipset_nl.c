@@ -446,6 +446,7 @@ int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
     int set_name_len = snprintf(set_name_nul, sizeof(set_name_nul), "%s", set_name) + 1;
 
     *new_count = 0;
+    int result = 0;
 
     for (int start = 0; start < count; start += IPSET_CHUNK_SIZE) {
         int end = start + IPSET_CHUNK_SIZE;
@@ -474,9 +475,14 @@ int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
 
         if (msg_count == 0) continue;
 
+        /* Entries added without timeout are the permanent ones. If one of them
+         * is not known to have been acknowledged (send/recv failure, wrong or
+         * short answer, a kernel error), it may be in the set without being in
+         * the index: stop refreshing that set. */
         for (int i = 0; i < msg_count; i++) {
             if (send(mgr->fd, msg_bufs[i], msg_lens[i], 0) < 0) {
                 LOG_ERROR("netlink send batch: %s", strerror(errno));
+                if (!with_timeout) ipset_perm_mark_incomplete(mgr, set_name_nul);
                 return -1;
             }
         }
@@ -486,31 +492,50 @@ int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
 
         for (int i = 0; i < msg_count; i++) {
             uint8_t resp[256];
-            int n = recv(mgr->fd, resp, sizeof(resp), 0);
-            if (n < 0) continue;
+            int n;
+            do {
+                n = recv(mgr->fd, resp, sizeof(resp), 0);
+            } while (n < 0 && errno == EINTR);
 
             struct nlmsghdr *nh = (struct nlmsghdr *)resp;
-            if (nh->nlmsg_type == NLMSG_ERROR) {
-                struct nlmsgerr *err = (struct nlmsgerr *)((uint8_t *)nh + NLMSG_HDRLEN);
-                const parsed_cidr_t *entry = &entries[valid_indices[i]];
-                if (err->error == 0) {
-                    if (with_timeout && new_indices) {
-                        new_indices[*new_count] = valid_indices[i];
-                        (*new_count)++;
-                    } else if (!with_timeout && has_timeout) {
+            if (n < (int)(NLMSG_HDRLEN + sizeof(struct nlmsgerr)) ||
+                nh->nlmsg_type != NLMSG_ERROR ||
+                nh->nlmsg_seq != ((struct nlmsghdr *)msg_bufs[i])->nlmsg_seq) {
+                if (!with_timeout) {
+                    LOG_WARN("ipset '%s': no valid answer to an ADD (%s)", set_name,
+                             n < 0 ? strerror(errno) : "short or foreign message");
+                    ipset_perm_mark_incomplete(mgr, set_name_nul);
+                    result = -1;
+                }
+                continue;
+            }
+
+            struct nlmsgerr *err = (struct nlmsgerr *)((uint8_t *)nh + NLMSG_HDRLEN);
+            const parsed_cidr_t *entry = &entries[valid_indices[i]];
+            if (err->error == 0) {
+                if (with_timeout && new_indices) {
+                    new_indices[*new_count] = valid_indices[i];
+                    (*new_count)++;
+                } else if (!with_timeout && has_timeout) {
+                    remember_permanent(mgr, set_name_nul, entry);
+                }
+            } else {
+                int errcode = -err->error;
+                if (errcode == IPSET_ERR_EXIST) {
+                    if (!with_timeout && has_timeout) {
                         remember_permanent(mgr, set_name_nul, entry);
+                    } else if (has_timeout && with_timeout &&
+                               !ipset_perm_incomplete(mgr, set_name_nul) &&
+                               !is_permanent(mgr, set_name_nul, entry)) {
+                        refresh[refresh_count++] = i;
                     }
+                } else if (errcode == IPSET_ERR_HASH_FULL) {
+                    LOG_WARN("ipset '%s' full (maxelem exceeded): set IpsetMaxElem in config", set_name);
                 } else {
-                    int errcode = -err->error;
-                    if (errcode == IPSET_ERR_EXIST) {
-                        if (has_timeout && with_timeout &&
-                            !ipset_perm_incomplete(mgr, set_name_nul) &&
-                            !is_permanent(mgr, set_name_nul, entry))
-                            refresh[refresh_count++] = i;
-                    } else if (errcode == IPSET_ERR_HASH_FULL) {
-                        LOG_WARN("ipset '%s' full (maxelem exceeded): set IpsetMaxElem in config", set_name);
-                    } else {
-                        LOG_DEBUG("Netlink ADD error: errno=%d", errcode);
+                    LOG_DEBUG("Netlink ADD error: errno=%d", errcode);
+                    if (!with_timeout) {
+                        ipset_perm_mark_incomplete(mgr, set_name_nul);
+                        result = -1;
                     }
                 }
             }
@@ -527,7 +552,7 @@ int ipset_add_batch(ipset_manager_t *mgr, const char *set_name,
         }
     }
 
-    return 0;
+    return result;
 }
 
 int ipset_refresh_set_list(ipset_manager_t *mgr) {

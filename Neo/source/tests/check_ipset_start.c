@@ -17,11 +17,13 @@
 static char calls[1024], info_log[1024];
 static int cidr_result;               /* what the faked CIDR load returns */
 static ipset_manager_t mgr;           /* the manager of the last start */
-static int sent_count, next_reply;    /* fake kernel for the DNS step */
+static int sent_count, recv_count, next_reply;    /* fake kernel for the DNS step */
 static uint16_t sent_flags[4];
+static uint32_t sent_seq[4];
 
 ssize_t __wrap_send(int fd, const void *buf, size_t len, int flags) {
     (void)fd; (void)flags;
+    sent_seq[sent_count] = ((const struct nlmsghdr *)buf)->nlmsg_seq;
     sent_flags[sent_count++] = ((const struct nlmsghdr *)buf)->nlmsg_flags;
     return (ssize_t)len;
 }
@@ -31,6 +33,7 @@ ssize_t __wrap_recv(int fd, void *buf, size_t len, int flags) {
     memset(buf, 0, len);
     struct nlmsghdr *h = buf;
     struct nlmsgerr *e = (struct nlmsgerr *)((uint8_t *)buf + NLMSG_HDRLEN);
+    h->nlmsg_seq = sent_seq[recv_count++];
     h->nlmsg_type = NLMSG_ERROR;
     h->nlmsg_len = NLMSG_HDRLEN + sizeof(*e);
     e->error = -next_reply;
@@ -160,7 +163,7 @@ int main(void) {
     cidr_result = -EIO;
     start("", 1, plain);
     mgr.fd = 3;
-    sent_count = 0;
+    sent_count = recv_count = 0;
     next_reply = IPSET_ERR_EXIST;
     assert(ipset_add_batch(&mgr, "HydraRoute", &host, 1, 1, &new_count, new_idx) == 0);
     assert(sent_count == 1 && (sent_flags[0] & NLM_F_EXCL));
@@ -168,7 +171,7 @@ int main(void) {
     cidr_result = -ENOENT;
     start("", 1, plain);
     mgr.fd = 3;
-    sent_count = 0;
+    sent_count = recv_count = 0;
     assert(ipset_add_batch(&mgr, "HydraRoute", &host, 1, 1, &new_count, new_idx) == 0);
     assert(sent_count == 2 && !(sent_flags[1] & NLM_F_EXCL));
     mgr.fd = -1;

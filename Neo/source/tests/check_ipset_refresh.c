@@ -4,29 +4,45 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <stdint.h>
 
 /* Fake kernel: remembers the flags of every message and answers with a scripted errno. */
 static uint16_t sent_flags[16];
+static uint32_t sent_seq[16];
+static int recv_errno, recv_fail_at = -1, recv_short_at = -1, recv_seq_off_at = -1, recv_eintr_at = -1;
 static int sent_count, recv_count;
 static int replies[16];
 
 ssize_t __wrap_send(int fd, const void *buf, size_t len, int flags) {
     (void)fd; (void)flags;
+    sent_seq[sent_count] = ((const struct nlmsghdr *)buf)->nlmsg_seq;
     sent_flags[sent_count++] = ((const struct nlmsghdr *)buf)->nlmsg_flags;
     return (ssize_t)len;
 }
 
 ssize_t __wrap_recv(int fd, void *buf, size_t len, int flags) {
     (void)fd; (void)flags;
+    if (recv_count == recv_eintr_at) {
+        recv_eintr_at = -1;
+        errno = EINTR;
+        return -1;
+    }
+    if (recv_count == recv_fail_at) {
+        recv_count++;
+        errno = recv_errno;
+        return -1;
+    }
     memset(buf, 0, len);
     struct nlmsghdr *h = buf;
+    h->nlmsg_seq = sent_seq[recv_count] + (recv_count == recv_seq_off_at);
     struct nlmsgerr *e = (struct nlmsgerr *)((uint8_t *)buf + NLMSG_HDRLEN);
     h->nlmsg_type = NLMSG_ERROR;
     h->nlmsg_len = NLMSG_HDRLEN + sizeof(*e);
-    e->error = -replies[recv_count++];
+    e->error = -replies[recv_count];
+    if (recv_count++ == recv_short_at) return NLMSG_HDRLEN;
     return (ssize_t)h->nlmsg_len;
 }
 
@@ -59,6 +75,7 @@ static int count_of(const char *needle) {
 static void reset(void) {
     sent_count = recv_count = 0;
     memset(replies, 0, sizeof(replies));
+    recv_fail_at = recv_short_at = recv_seq_off_at = recv_eintr_at = -1;
 }
 
 int main(void) {
@@ -432,6 +449,60 @@ int main(void) {
     assert(realloc_calls == 1 && ipset_perm_incomplete(&oom, "C"));
     oom.fd = -1;
     ipset_manager_close(&oom);
+
+    /* The answer to a permanent ADD is lost or wrong: the host may be in the
+     * set without being in the index. The load says so, the set stops
+     * refreshing, and the DNS answer for the kept host leaves it alone. */
+    static const struct { const char *what; int *at; int val; int err; } bad[] = {
+        {"recv error", &recv_fail_at, 0, ENOBUFS},
+        {"short answer", &recv_short_at, 0, 0},
+        {"foreign sequence", &recv_seq_off_at, 0, 0},
+    };
+    for (size_t b = 0; b < sizeof(bad) / sizeof(bad[0]); b++) {
+        ipset_manager_t lost;
+        memset(&lost, 0, sizeof(lost));
+        lost.default_timeout = 21600;
+        parsed_cidr_t two[2] = {host, host};
+        two[1].ip[3] = 9;
+        reset();
+        *bad[b].at = bad[b].val;
+        recv_errno = bad[b].err;
+        assert(ipset_add_batch(&lost, "K", two, 2, 0, &new_count, new_idx) == -1);
+        assert(ipset_perm_incomplete(&lost, "K") && !ipset_perm_incomplete(&lost, "Other"));
+        reset();
+        replies[0] = IPSET_ERR_EXIST;
+        assert(ipset_add_batch(&lost, "K", &host, 1, 1, &new_count, new_idx) == 0);
+        assert(sent_count == 1);
+        lost.fd = -1;
+        ipset_manager_close(&lost);
+    }
+    /* EINTR is retried and is no failure; a kernel error on a permanent ADD is. */
+    ipset_manager_t intr;
+    memset(&intr, 0, sizeof(intr));
+    intr.default_timeout = 21600;
+    reset();
+    recv_eintr_at = 0;
+    assert(ipset_add_batch(&intr, "K", &host, 1, 0, &new_count, new_idx) == 0);
+    assert(!ipset_perm_incomplete(&intr, "K") && intr.permanent.count == 1);
+    reset();
+    replies[0] = 1;    /* EPERM */
+    assert(ipset_add_batch(&intr, "E", &host, 1, 0, &new_count, new_idx) == -1);
+    assert(ipset_perm_incomplete(&intr, "E"));
+    /* Set full and an entry that already exists are no loss of the index. */
+    reset();
+    replies[0] = IPSET_ERR_HASH_FULL;
+    assert(ipset_add_batch(&intr, "F", &host, 1, 0, &new_count, new_idx) == 0);
+    assert(!ipset_perm_incomplete(&intr, "F"));
+    reset();
+    replies[0] = IPSET_ERR_EXIST;
+    assert(ipset_add_batch(&intr, "X", &host, 1, 0, &new_count, new_idx) == 0);
+    assert(!ipset_perm_incomplete(&intr, "X"));
+    reset();
+    replies[0] = IPSET_ERR_EXIST;
+    assert(ipset_add_batch(&intr, "X", &host, 1, 1, &new_count, new_idx) == 0);
+    assert(sent_count == 1);
+    intr.fd = -1;
+    ipset_manager_close(&intr);
 
     puts("check_ipset_refresh: OK");
     return 0;

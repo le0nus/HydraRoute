@@ -108,19 +108,23 @@ static int parse_cidr_body(const uint8_t *data, int len, geoip_entry_t *entry) {
     return 0;
 }
 
-typedef void (*geoip_cidr_fn)(const geoip_entry_t *entry, void *ctx);
+/* fn returns nonzero when it could not keep the entry (no memory). The walk
+ * returns -1 if it stopped early: a broken field, or an entry fn dropped. */
+typedef int (*geoip_cidr_fn)(const geoip_entry_t *entry, void *ctx);
 
-static void for_each_geoip_cidr(const uint8_t *data, int len,
-                                geoip_cidr_fn fn, void *ctx) {
+static int for_each_geoip_cidr(const uint8_t *data, int len,
+                               geoip_cidr_fn fn, void *ctx) {
     int pos = 0;
+    int rc;
     pb_field_t f;
 
-    while (pb_next_field(data, len, &pos, &f) == 1) {
+    while ((rc = pb_next_field(data, len, &pos, &f)) == 1) {
         if (f.field != 2 || f.wire_type != 2) continue;
         geoip_entry_t entry;
-        if (parse_cidr_body(f.body, f.body_len, &entry) == 0)
-            fn(&entry, ctx);
+        if (parse_cidr_body(f.body, f.body_len, &entry) == 0 && fn(&entry, ctx) != 0)
+            return -1;
     }
+    return rc < 0 ? -1 : 0;
 }
 
 static int parse_geosite_domain(const uint8_t *data, int len, geosite_domain_t *domain) {
@@ -196,25 +200,34 @@ static void extract_geoip_country(const char *entry, char *out, size_t out_size)
     out[n] = 0;
 }
 
-typedef void (*dat_body_visitor_t)(const uint8_t *body, int body_len, void *ctx);
+/* visit returns nonzero if it could not take the whole body. */
+typedef int (*dat_body_visitor_t)(const uint8_t *body, int body_len, void *ctx);
 
+/* Returns -1 if the file cannot be opened. With cut_short, a scan that ended
+ * before the end of the file (read error, truncation, a body that did not fit
+ * in memory, a visitor that lost data) sets *cut_short = 1: what was seen is
+ * then not all of the country. */
 static int scan_dat_file(const char *file_path, const char *target_upper,
-                          dat_body_visitor_t visit, void *ctx) {
+                          dat_body_visitor_t visit, void *ctx, int *cut_short) {
     FILE *f = fopen(file_path, "rb");
     if (!f) return -1;
     setvbuf(f, NULL, _IOFBF, 64 * 1024);
+    int cut = 0;
 
     while (1) {
         int top_tag = fgetc(f);
-        if (top_tag == EOF) break;
-        if (top_tag != 0x0A) break;
+        if (top_tag == EOF) {
+            if (ferror(f)) cut = 1;
+            break;
+        }
+        if (top_tag != 0x0A) { cut = 1; break; }
 
         uint64_t body_len;
-        if (read_varint_stream(f, &body_len) < 0) break;
+        if (read_varint_stream(f, &body_len) < 0) { cut = 1; break; }
 
         uint8_t *body = malloc(body_len);
-        if (!body) break;
-        if (fread(body, 1, body_len, f) != body_len) { free(body); break; }
+        if (!body) { cut = 1; break; }
+        if (fread(body, 1, body_len, f) != body_len) { free(body); cut = 1; break; }
 
         if (body_len < 2 || body[0] != 0x0A) { free(body); continue; }
 
@@ -231,12 +244,13 @@ static int scan_dat_file(const char *file_path, const char *target_upper,
 
         if (strcmp(code, target_upper) == 0) {
             int data_pos = code_start + (int)code_len;
-            visit(body + data_pos, (int)body_len - data_pos, ctx);
+            if (visit(body + data_pos, (int)body_len - data_pos, ctx) != 0) cut = 1;
         }
         free(body);
     }
 
     fclose(f);
+    if (cut_short) *cut_short = cut;
     return 0;
 }
 
@@ -245,14 +259,15 @@ typedef struct {
     int *ipv6;
 } count_ctx_t;
 
-static void count_geoip_entry(const geoip_entry_t *entry, void *ctx) {
+static int count_geoip_entry(const geoip_entry_t *entry, void *ctx) {
     count_ctx_t *c = (count_ctx_t *)ctx;
     if (entry->ip_len == 4) (*c->ipv4)++;
     else if (entry->ip_len == 16) (*c->ipv6)++;
+    return 0;
 }
 
-static void count_geoip_visitor(const uint8_t *body, int len, void *ctx) {
-    for_each_geoip_cidr(body, len, count_geoip_entry, ctx);
+static int count_geoip_visitor(const uint8_t *body, int len, void *ctx) {
+    return for_each_geoip_cidr(body, len, count_geoip_entry, ctx);
 }
 
 static void count_geoip_cidrs_all_files(
@@ -267,7 +282,7 @@ static void count_geoip_cidrs_all_files(
 
     count_ctx_t ctx = { out_ipv4, out_ipv6 };
     for (int gi = 0; gi < geoip_count; gi++)
-        scan_dat_file(geoip_files[gi], target, count_geoip_visitor, &ctx);
+        scan_dat_file(geoip_files[gi], target, count_geoip_visitor, &ctx, NULL);
 }
 
 typedef struct {
@@ -276,22 +291,25 @@ typedef struct {
     int *capacity;
 } extract_geoip_ctx_t;
 
-static void append_geoip_entry(const geoip_entry_t *entry, void *ctx) {
+static int append_geoip_entry(const geoip_entry_t *entry, void *ctx) {
     extract_geoip_ctx_t *c = (extract_geoip_ctx_t *)ctx;
     if (*c->count >= *c->capacity) {
         int new_cap = *c->capacity * 2;
         geoip_entry_t *tmp = realloc(*c->entries, new_cap * sizeof(geoip_entry_t));
-        if (!tmp) return;
+        if (!tmp) return -1;
         *c->entries = tmp;
         *c->capacity = new_cap;
     }
     (*c->entries)[(*c->count)++] = *entry;
+    return 0;
 }
 
-static void extract_geoip_visitor(const uint8_t *body, int len, void *ctx) {
-    for_each_geoip_cidr(body, len, append_geoip_entry, ctx);
+static int extract_geoip_visitor(const uint8_t *body, int len, void *ctx) {
+    return for_each_geoip_cidr(body, len, append_geoip_entry, ctx);
 }
 
+/* 0 only if the country was read completely; otherwise nothing is returned
+ * (entries freed) and the caller must treat the list as not loaded. */
 static int extract_geoip_cidrs(const char *file_path, const char *country_code,
                                geoip_entry_t **out_entries, int *out_count) {
     char target[64];
@@ -299,12 +317,22 @@ static int extract_geoip_cidrs(const char *file_path, const char *country_code,
 
     int capacity = 4096;
     *out_entries = malloc(capacity * sizeof(geoip_entry_t));
-    if (!*out_entries) return -1;
     *out_count = 0;
+    if (!*out_entries) return -1;
 
     extract_geoip_ctx_t ctx = { out_entries, out_count, &capacity };
-    int rc = scan_dat_file(file_path, target, extract_geoip_visitor, &ctx);
+    int cut = 0;
+    int rc = scan_dat_file(file_path, target, extract_geoip_visitor, &ctx, &cut);
     if (rc != 0) LOG_WARN("GeoIP file not found: %s", file_path);
+    else if (cut) {
+        LOG_WARN("GeoIP file %s not read completely", file_path);
+        rc = -1;
+    }
+    if (rc != 0) {
+        free(*out_entries);
+        *out_entries = NULL;
+        *out_count = 0;
+    }
     return rc;
 }
 
@@ -314,9 +342,10 @@ typedef struct {
     int *capacity;
 } extract_geosite_ctx_t;
 
-static void extract_geosite_visitor(const uint8_t *body, int len, void *ctx) {
+static int extract_geosite_visitor(const uint8_t *body, int len, void *ctx) {
     extract_geosite_ctx_t *c = (extract_geosite_ctx_t *)ctx;
     parse_geosite_body(body, len, c->domains, c->count, c->capacity);
+    return 0;
 }
 
 static int extract_geosite_domains(const char *file_path, const char *tag,
@@ -330,7 +359,7 @@ static int extract_geosite_domains(const char *file_path, const char *tag,
     *out_count = 0;
 
     extract_geosite_ctx_t ctx = { out_domains, out_count, &capacity };
-    int rc = scan_dat_file(file_path, target, extract_geosite_visitor, &ctx);
+    int rc = scan_dat_file(file_path, target, extract_geosite_visitor, &ctx, NULL);
     if (rc != 0) LOG_WARN("GeoSite file not found: %s", file_path);
     return rc;
 }
@@ -933,7 +962,7 @@ typedef struct {
     int           *usage_count;
     name_index_t  *usage_index;
 
-    int            failed;   /* an entry was lost to an allocation failure */
+    int            failed;   /* entries were lost: no memory, or a GeoIP file missing/cut short */
 } phase2_ctx_t;
 
 static const char *batch_name_at(const void *base, int idx) {
@@ -1030,8 +1059,13 @@ static void phase2_on_entry(const cidr_block_t *blk, const char *entry, void *ct
             geoip_entry_t *entries = NULL;
             int entry_count = 0;
 
-            if (extract_geoip_cidrs(cx->geoip_files[gi], country, &entries, &entry_count) != 0)
+            /* The file is a dependency of the list: if it is missing or cut
+             * short, hosts from it may be in the kept sets and not in the
+             * index (Ruling 42: no ENOENT exemption here). */
+            if (extract_geoip_cidrs(cx->geoip_files[gi], country, &entries, &entry_count) != 0) {
+                cx->failed = 1;
                 continue;
+            }
 
             for (int e = 0; e < entry_count; e++) {
                 char target_set[64];
@@ -1182,7 +1216,7 @@ int add_cidr_to_ipsets(ipset_manager_t *mgr, const char *cidr_path,
         LOG_WARN("CIDR file %s not read to the end: %s", cidr_path, strerror(err));
         result = -err;
     }
-    if (p2.failed && result == 0) result = -ENOMEM;
+    if (p2.failed && result == 0) result = -EIO;
 
     for (int i = 0; i < batch_count; i++) {
         if (batches[i].count == 0) {
