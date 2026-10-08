@@ -182,6 +182,34 @@ const char *line_find(const char *line, size_t line_len, const char *needle) {
     return NULL;
 }
 
+int proc_list_has(const char *path, const char *name) {
+    char buf[256];
+    size_t len = 0, nlen = strlen(name);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    for (;;) {
+        ssize_t n = read(fd, buf + len, sizeof(buf) - 1 - len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            close(fd);
+            return -1;
+        }
+        len += (size_t)n;
+        if (n == 0 || len == sizeof(buf) - 1) break;
+    }
+    int whole = len < sizeof(buf) - 1;      /* else there may be more */
+    close(fd);
+    buf[len] = '\0';
+    for (const char *line = buf; *line; ) {
+        const char *nl = strchr(line, '\n');
+        size_t l = nl ? (size_t)(nl - line) : strlen(line);
+        if (l == nlen && memcmp(line, name, l) == 0) return 1;
+        if (!nl) break;
+        line = nl + 1;
+    }
+    return whole ? 0 : -1;
+}
+
 /* Stdout is dropped; the first line of stderr is kept in err, since that is
  * where iptables-restore says which line failed. */
 int run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t input_len,

@@ -18,5 +18,8 @@ int run_command_output(const char *cmd, char *const argv[], char *output, size_t
 int run_command_stdin(const char *cmd, char *const argv[], const char *input, size_t input_len,
                       char *err, size_t err_size);
 const char *line_find(const char *line, size_t line_len, const char *needle);
+/* A /proc list of names, one per line (/proc/net/ip_tables_names): 1 if name
+ * is listed, 0 if the whole list was read and it is not, -1 if unknown. */
+int proc_list_has(const char *path, const char *name);
 
 #endif

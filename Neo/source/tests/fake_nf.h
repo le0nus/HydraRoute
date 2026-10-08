@@ -50,6 +50,10 @@ static int  restore_error_family = -1; /* family restore_error applies to, -1: b
 static int  restore_error_table = -1;  /* table restore_error applies to: 0 mangle, 1 raw, -1 both */
 static int  dump_fail[2];              /* iptables -t mangle -S fails or is truncated */
 static const char *dump_fail_chain[2]; /* ... only for this mangle chain */
+static int  dump_fail_at[2];           /* ... only the n-th mangle read since reset() */
+static int  mangle_dumps[2];           /* mangle reads per family since reset() */
+static int  raw_listed[2] = {1, 1};    /* /proc/net/ip*_tables_names: 1 has raw, 0 not, -1 unreadable */
+static int  proc_calls;
 static int  raw_dump_fail[2];          /* iptables -t raw -S fails (no table) or is truncated */
 static int  raw_echo_other;            /* fake an iptables that prints the MARK target otherwise */
 static int  kmod_result;               /* xt_conntrack */
@@ -112,8 +116,10 @@ int __wrap_run_command_output(const char *cmd, char *const argv[], char *output,
     size_t off = 0;
     dumps++;
     output[0] = '\0';
+    if (!raw) mangle_dumps[fi]++;
     if (raw ? raw_dump_fail[fi]
-            : dump_fail[fi] || (dump_fail_chain[fi] && strcmp(argv[5], dump_fail_chain[fi]) == 0))
+            : dump_fail[fi] || dump_fail_at[fi] == mangle_dumps[fi] ||
+              (dump_fail_chain[fi] && strcmp(argv[5], dump_fail_chain[fi]) == 0))
         return -1;
 #define OUT(...) (off += (size_t)snprintf(output + off, size - off, __VA_ARGS__))
     if (raw) {
@@ -168,6 +174,14 @@ static inline void raw_foreign(const fake_nf_t *f, char *out, size_t size) {
             snprintf(out + strlen(out), size - strlen(out), "%s\n", f->raw_pre[i]);
 }
 
+static inline int has_unconditional_restore(int fi) {
+    for (int i = 0; i < nf[fi].mangle_len; i++)
+        if (strstr(nf[fi].mangle[i], "--restore-mark") &&
+            !strstr(nf[fi].mangle[i], "-m connmark ! --mark 0x0 "))
+            return 1;
+    return 0;
+}
+
 /* §3.2: while raw marks packets, no unconditional --restore-mark may be left
  * in mangle, or it writes connmark 0 over the raw mark of every new connection. */
 static inline void assert_no_unconditional_restore(int fi) {
@@ -208,6 +222,7 @@ int __wrap_run_command_stdin(const char *cmd, char *const argv[], const char *in
     memcpy(buf, input, len);
     buf[len] = '\0';
     raw_foreign(f, foreign_before, sizeof(foreign_before));
+    int danger_before = f->guard_len > 0 && has_unconditional_restore(fi);
     char *save;
     for (char *line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
         char chain[16] = "";
@@ -259,7 +274,11 @@ int __wrap_run_command_stdin(const char *cmd, char *const argv[], const char *in
     }
     raw_foreign(f, foreign_after, sizeof(foreign_after));
     assert(strcmp(foreign_before, foreign_after) == 0);     /* foreign raw rules stay, in order */
-    if (f->guard_len > 0) assert_no_unconditional_restore(fi);
+    /* A raw write never leaves a marking chain next to an unconditional
+     * restore; a mangle write never creates that state (one that was there
+     * before the call, a rollback leftover, is taken down by the raw write
+     * that follows in the same call, which the tests check). */
+    if (f->guard_len > 0 && (table || !danger_before)) assert_no_unconditional_restore(fi);
     return 0;
 }
 
@@ -295,6 +314,15 @@ int __wrap_l7_firewall_load_kmod_if_present(const char *name) {
     return -1;
 }
 
+/* The kernel's list of loaded tables of a family. */
+int __wrap_proc_list_has(const char *path, const char *name) {
+    int fi = strcmp(path, "/proc/net/ip6_tables_names") == 0;
+    assert(fi || strcmp(path, "/proc/net/ip_tables_names") == 0);
+    assert(strcmp(name, "raw") == 0);
+    proc_calls++;
+    return raw_listed[fi];
+}
+
 int rci_get_policy_mark(const char *name, char *mark, int mark_size) {
     int ru = strcmp(name, "RU") == 0;
     int r = rci_result != RCI_MARK_OK ? rci_result : ru ? rci_result_ru : rci_result_hr;
@@ -311,6 +339,8 @@ static inline void reset(void) {
     error_log[0] = '\0';
     dumps = rci_calls = warns = errors = kmod_calls = 0;
     raw_kmod_calls[0] = raw_kmod_calls[1] = 0;
+    mangle_dumps[0] = mangle_dumps[1] = 0;
+    proc_calls = 0;
 }
 
 static inline void setup_targets(unified_target_t *t, config_t *cfg) {

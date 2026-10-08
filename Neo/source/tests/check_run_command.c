@@ -31,6 +31,26 @@ int main(void) {
     assert(strncmp(err, "Another app is currently holding", 32) == 0);
     assert(strlen(err) < sizeof(err));
 
+    /* A /proc list of names, one per line (/proc/net/ip_tables_names). */
+    const char *names = "build/check_run_command.names";
+    FILE *f = fopen(names, "w");
+    assert(f);
+    fputs("nat\nmangle\nraw\nfilter\n", f);
+    fclose(f);
+    assert(proc_list_has(names, "raw") == 1);
+    assert(proc_list_has(names, "filter") == 1);
+    assert(proc_list_has(names, "ra") == 0);
+    assert(proc_list_has(names, "security") == 0);
+    assert(proc_list_has("build/no-such-file", "raw") == -1);
+    /* Longer than what is read: a name not seen is unknown, not absent. */
+    f = fopen(names, "w");
+    assert(f);
+    for (int i = 0; i < 64; i++) fprintf(f, "table%02d\n", i);
+    fclose(f);
+    assert(proc_list_has(names, "table01") == 1);
+    assert(proc_list_has(names, "raw") == -1);
+    remove(names);
+
     puts("check_run_command: OK");
     return 0;
 }

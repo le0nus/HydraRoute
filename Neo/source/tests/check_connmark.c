@@ -566,6 +566,33 @@ static void check_raw(const unified_target_t *t, config_t *cfg) {
     assert_raw(0, 0xff2);
     assert(status_has("raw_guard=on"));
 
+    /* What an earlier call saw does not count in the next one: the foreign
+     * restore is gone and the chain is back (put in by hand), then the mangle
+     * read fails. Nothing is known about this call's mangle, so the working
+     * jump stays. */
+    reset();
+    raw_clear(0);
+    lines_add(nf[0].mangle, &nf[0].mangle_len, OLD_FOREIGN);
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(calls[0] == '\0' && status_has("raw_guard=degraded:old-restore-v4"));
+    mangle_remove_matching(0, "--match-set Old dst ");
+    raw_clear(0);
+    nf[0].guard_exists = 1;
+    lines_add(nf[0].guard, &nf[0].guard_len, HR_RAW[0]);
+    lines_add(nf[0].guard, &nf[0].guard_len,
+              "-A HRNEO_GUARD -m set --match-set RU dst -j MARK --set-xmark 0xff1/0xffffffff");
+    lines_insert0(nf[0].raw_pre, &nf[0].raw_pre_len, GUARD_JUMP);
+    reset();
+    dump_fail[0] = 1;
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
+    dump_fail[0] = 0;
+    assert(calls[0] == '\0');
+    assert_raw(0, 0xff2);
+    assert(status_has("raw_guard=degraded:dump-v4"));
+    reset();
+    assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == 0);
+    assert(calls[0] == '\0' && status_has("raw_guard=on"));
+
     /* Any unconditional restore left in mangle keeps raw from going in, in
      * either family: IPv6 has one, IPv4 raw is missing and stays out. */
     reset();
@@ -622,16 +649,17 @@ static void check_raw(const unified_target_t *t, config_t *cfg) {
     assert_raw(0, 0xff2);
     assert(status_has("raw_guard=on"));
 
-    /* The raw dump fails or is cut short: nothing is written to raw, "no
-     * dump" is not taken for "no chain", and the count is unknown, not 0. */
+    /* The raw dump fails or is cut short while the kernel lists the table:
+     * nothing is written to raw, "no dump" is not taken for "no chain", the
+     * count is unknown, not 0, and the call is retried. */
     reset();
     raw_dump_fail[0] = 1;
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
     assert(apply_unified_connmark_rules(t, 2, cfg, NULL) == -1);
-    assert(calls[0] == '\0');
+    assert(calls[0] == '\0' && proc_calls == 2);
     assert(warns == 2);                     /* the dump once, the raw guard */
     assert(strstr(warn_log, "iptables -t raw -S failed or output truncated"));
-    assert(status_has("raw_guard=degraded:audit-v4"));
+    assert(status_has("raw_guard=degraded:dump-v4"));
     assert(status_has("raw_rules_v4=unknown") && status_has("raw_rules_v6=2"));
     raw_dump_fail[0] = 0;
     reset();

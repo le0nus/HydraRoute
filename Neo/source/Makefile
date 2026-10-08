@@ -83,10 +83,12 @@ check:
 	./build/check_signal_timer
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_nf.c src/l7_firewall.c src/util.c src/log.c -o build/check_nf
 	./build/check_nf
-	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=run_command_output,--wrap=run_command_stdin,--wrap=log_write,--wrap=l7_firewall_load_kmod_if_present tests/check_connmark.c src/iptables.c src/guard.c src/guard_status.c src/l7_firewall.c src/util.c src/log.c -o build/check_connmark
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=run_command_output,--wrap=run_command_stdin,--wrap=log_write,--wrap=l7_firewall_load_kmod_if_present,--wrap=proc_list_has tests/check_connmark.c src/iptables.c src/guard.c src/guard_status.c src/l7_firewall.c src/util.c src/log.c -o build/check_connmark
 	./build/check_connmark
-	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=run_command_output,--wrap=run_command_stdin,--wrap=log_write,--wrap=l7_firewall_load_kmod_if_present tests/check_raw_modules.c src/iptables.c src/guard.c src/guard_status.c src/l7_firewall.c src/util.c src/log.c -o build/check_raw_modules
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=run_command_output,--wrap=run_command_stdin,--wrap=log_write,--wrap=l7_firewall_load_kmod_if_present,--wrap=proc_list_has tests/check_raw_modules.c src/iptables.c src/guard.c src/guard_status.c src/l7_firewall.c src/util.c src/log.c -o build/check_raw_modules
 	./build/check_raw_modules
+	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=run_command_output,--wrap=run_command_stdin,--wrap=log_write,--wrap=l7_firewall_load_kmod_if_present,--wrap=proc_list_has tests/check_raw_start.c src/iptables.c src/guard.c src/guard_status.c src/l7_firewall.c src/util.c src/log.c -o build/check_raw_start
+	./build/check_raw_start
 	$(CC_NATIVE) $(CFLAGS_NATIVE) -Wl,--wrap=log_write,--wrap=fwrite,--wrap=fclose,--wrap=rename tests/check_guard_status.c src/guard_status.c src/log.c src/util.c -o build/check_guard_status
 	./build/check_guard_status
 	$(CC_NATIVE) $(CFLAGS_NATIVE) tests/check_rci.c src/util.c src/log.c src/config.c src/params.c -o build/check_rci

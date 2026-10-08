@@ -52,10 +52,10 @@ typedef struct {
     size_t len;             /* batch length; counts on past the buffer, see batch_append */
     int  rule_count;
     int  warned_audit;
-    int  unsafe;            /* the last dump_chains() read PREROUTING whole, and it holds
-                             * an unconditional restore (unsafe_restore) */
+    int  unsafe;            /* the latest PREROUTING read of this call holds an
+                             * unconditional restore (unsafe_restore); a failed read
+                             * keeps what an earlier one in the call found */
     int  raw_kmod;          /* raw table module: 0 not tried, 1 loaded or no .ko, -1 load failed */
-    int  raw_seen;          /* a raw dump has worked in this process */
     int  warned_raw_dump, warned_raw;
 } connmark_family_t;
 
@@ -159,7 +159,6 @@ static const char *const DUMP_CHAINS[] = {"PREROUTING", "FORWARD", "OUTPUT"};
 
 static int dump_chains(connmark_family_t *fam, int chain_count) {
     size_t off = 0;
-    fam->unsafe = 0;
     for (int c = 0; c < chain_count; c++) {
         char *argv[] = {(char *)fam->ipt_cmd, "-w", "-t", "mangle", "-S",
                         (char *)DUMP_CHAINS[c], NULL};
@@ -169,8 +168,9 @@ static int dump_chains(connmark_family_t *fam, int chain_count) {
                      fam->ipt_cmd, DUMP_CHAINS[c]);
             return -1;
         }
-        /* Judged as soon as PREROUTING is read: a FORWARD or OUTPUT dump
-         * that fails or overflows next must not hide it (Ruling 29). */
+        /* Judged as soon as PREROUTING is read whole: a FORWARD or OUTPUT
+         * dump that fails or overflows next, or a read-back that fails, must
+         * not hide it (Ruling 29). */
         if (c == 0) fam->unsafe = unsafe_restore(fam->dump);
         off += strlen(fam->dump + off);
     }
@@ -442,6 +442,7 @@ static int commit_mangle(connmark_family_t *fam, owned_index_t *own,
                          const unified_target_t *targets, const set_list_t *sets, int fi,
                          const config_t *cfg, const char *l7_wan, family_result_t *r) {
     int l7 = l7_wan && l7_wan[0];
+    fam->unsafe = 0;        /* this call's reads decide */
     r->reason = "dump";     /* no dump, or more hrneo lines than the index holds */
     if (dump_chains(fam, l7 ? 3 : 1) != 0 || collect_owned(fam, sets, fi, own) != 0)
         return -1;
@@ -562,7 +563,6 @@ static int dump_raw(connmark_family_t *fam) {
         return -1;
     }
     fam->warned_raw_dump = 0;
-    fam->raw_seen = 1;
     return 0;
 }
 
@@ -646,6 +646,7 @@ static int unhook_unsafe(const unified_target_t *targets, int count, family_resu
     for (int fi = 0; fi < 2; fi++) {
         connmark_family_t *fam = family(fi);
         raw_view_t v;
+        fam->unsafe = 0;
         if (dump_chains(fam, 1) != 0 || !fam->unsafe || dump_raw(fam) != 0)
             continue;
         scan_raw(fam, targets, count, fi, &v);
@@ -669,7 +670,6 @@ static int commit_raw(connmark_family_t *fam, const unified_target_t *targets, i
                       int fi, int gate, int all_marks, int unsafe, family_result_t *r) {
     const char *mangle_reason = r->reason;
     raw_view_t v;
-    int ret = 0;
 
     /* Loaded once per process. No .ko is not a failure: the table may be
      * built into the kernel, and reading it decides. */
@@ -677,23 +677,34 @@ static int commit_raw(connmark_family_t *fam, const unified_target_t *targets, i
         fam->raw_kmod = l7_firewall_load_kmod_if_present(fi ? "ip6table_raw" : "iptable_raw") == 0
                         ? 1 : -1;
     if (fam->raw_kmod < 0) {
-        r->reason = "modules";
+        r->reason = "raw-modules";
         return 0;
     }
-    int seen = fam->raw_seen;
     if (dump_raw(fam) != 0) {
-        /* Never read in this process: no table, a stable state, no retries. */
-        r->reason = seen ? "audit" : "modules";
-        return seen ? -1 : 0;
+        /* Absent only on evidence (Ruling 30). The failed read asked the
+         * kernel for the table (module autoload, table set up on first use),
+         * so a table the kernel does not list is not there: a stable state
+         * with no retries of its own. Listed, or the list unreadable: the
+         * read failed, and the call is retried. */
+        if (proc_list_has(fi ? "/proc/net/ip6_tables_names" : "/proc/net/ip_tables_names",
+                          "raw") == 0) {
+            r->reason = "raw-modules";
+            return 0;
+        }
+        r->reason = "dump";
+        return -1;
     }
     scan_raw(fam, targets, count, fi, &v);
     r->raw_rules = v.rules;
 
-    if (unsafe && v.jumps > 0) ret = unhook_raw(fam, targets, count, fi, &v, r);
+    if (unsafe && v.jumps > 0) {
+        r->reason = "old-restore";          /* named for the jump taken down */
+        return unhook_raw(fam, targets, count, fi, &v, r);
+    }
     r->reason = !all_marks ? "no-mark" : unsafe ? "old-restore" : mangle_reason;
     /* Without the gate a chain in place stays as it is; the family that
      * closed the gate names the reason. */
-    if (r->reason || !gate) return ret;
+    if (r->reason || !gate) return 0;
     if (raw_exact(&v)) {
         fam->warned_raw = 0;
         return 0;
